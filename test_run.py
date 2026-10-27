@@ -2,11 +2,12 @@
 test_run.py
 
 Двухуровневый решатель диспетчеризации роботов на графе (MAPD с передачей грузов):
-1. Верхний уровень (CP-SAT): распределение задач, выбор эстафет (handoff) и временных окон.
-2. Нижний уровень (CBS + Space-Time A*): потактовое построение бесконфликтных путей
-   с синхронизацией встреч, контролем расхода батареи и вместимости вершин (<= 2).
+1. Верхний уровень (CP-SAT): балансировка нагрузки (VRP/дизъюнктивное расписание),
+   выбор эстафет (handoff), расчет холостых переходов и минимизация реального makespan.
+2. Нижний уровень (CBS + Space-Time A*): синхронизированное потактовое планирование
+   траекторий в хронологическом порядке, контроль вместимости вершин (<= 2) и батареи.
 
-Соответствует контракту паспорта проекта и интерфейсам failure.py и visualize.py.
+Полностью совместим с failure.py и visualize.py.
 """
 
 from __future__ import annotations
@@ -84,9 +85,6 @@ class SpaceTimeAStar:
         max_capacity: int,
         blocked_vertices: Dict[int, int],
     ) -> Optional[List[Tuple[int, int]]]:
-        """
-        Возвращает путь как список пар (vertex, battery_left) для t от start_t до t_arrival.
-        """
         counter = 0
         h0 = max(dist_matrix[start_v][goal_v], max(0, min_goal_t - start_t))
         pq = [(start_t + h0, start_t, counter, start_v, start_batt, [(start_v, start_batt)])]
@@ -138,12 +136,6 @@ class SpaceTimeAStar:
 
 
 class GraphHandoffCpSatSolver:
-    """
-    Двухуровневый решатель:
-    1. CP-SAT выбирает распределение задач, точки эстафет и временные рамки.
-    2. CBS + Space-Time A* находит потактовые траектории роботов.
-    """
-
     def __init__(
         self,
         num_vertices: int,
@@ -167,7 +159,7 @@ class GraphHandoffCpSatSolver:
         self,
         robots: List[RobotSpec],
         tasks: List[TaskSpec],
-        max_horizon: int = 30,
+        max_horizon: int = 40,
         allow_floor_drop: bool = False,
         time_limit_s: float = 30.0,
         blocked_vertices: Optional[Dict[int, int]] = None,
@@ -188,7 +180,7 @@ class GraphHandoffCpSatSolver:
             )
 
         # ---------------------------------------------------------------------
-        # ЭТАП 1: Верхний уровень (CP-SAT) — планирование эстафеты и задач
+        # 1. Верхний уровень (CP-SAT): распределение, транзиты, makespan
         # ---------------------------------------------------------------------
         high_level_plan = self._solve_high_level(
             robots,
@@ -196,7 +188,7 @@ class GraphHandoffCpSatSolver:
             max_horizon,
             blocked,
             allow_undelivered,
-            time_limit_s=min(10.0, time_limit_s * 0.4),
+            time_limit_s=min(12.0, time_limit_s * 0.5),
         )
 
         if not high_level_plan["success"]:
@@ -209,7 +201,7 @@ class GraphHandoffCpSatSolver:
             )
 
         # ---------------------------------------------------------------------
-        # ЭТАП 2: Нижний уровень (CBS + Space-Time A*) — потактовые траектории
+        # 2. Нижний уровень (CBS + Space-Time A*): синхронизация в lock-step
         # ---------------------------------------------------------------------
         remaining_time = max(1.0, time_limit_s - (time.time() - start_time))
         low_level_result = self._solve_low_level_cbs(
@@ -232,56 +224,47 @@ class GraphHandoffCpSatSolver:
         allow_undelivered: bool,
         time_limit_s: float,
     ) -> dict:
-        """Решает задачу назначения, выбора узлов передач и интервалов (строго линейно)."""
+        """
+        Дизъюнктивная модель расписания:
+        - Связывает makespan со временем реального окончания задач каждым роботом
+        - Учитывает холостые переходы между задачами
+        """
         model = cp_model.CpModel()
         R = len(robots)
         K = len(tasks)
         INF = 10**9
 
-        # Кандидаты в узлы передачи: точки на кратчайших путях
         candidates: Dict[int, List[int]] = {}
         for k, task in enumerate(tasks):
             A, B = task.start_vertex, task.finish_vertex
             d_AB = self.dist[A][B]
             cands = []
-            if d_AB < INF:
+            if d_AB < INF and d_AB > 2:
                 for v in self.vertices:
                     if v != A and v != B and blocked.get(v, 0) == 0:
                         detour = self.dist[A][v] + self.dist[v][B]
                         if detour <= d_AB + 2:
                             cands.append((detour, v))
-                if not cands and d_AB > 2:
-                    for v in self.vertices:
-                        if v != A and v != B and blocked.get(v, 0) == 0:
-                            detour = self.dist[A][v] + self.dist[v][B]
-                            if detour <= d_AB + 4:
-                                cands.append((detour, v))
-            cands.sort()
-            candidates[k] = [v for _, v in cands[:15]]
+                cands.sort()
+                candidates[k] = [v for _, v in cands[:8]]
+            else:
+                candidates[k] = []
 
         delivered = [model.NewBoolVar(f"deliv_{k}") for k in range(K)]
-
-        # direct[k, r] = 1: робот r везёт груз k от A до B напрямую
         direct = {
             (k, r): model.NewBoolVar(f"dir_{k}_{r}") for k in range(K) for r in range(R)
         }
-
-        # relay_h[k, h] = 1: задача k передаётся в узле h
         relay_h = {
             (k, h): model.NewBoolVar(f"rel_h_{k}_{h}")
             for k in range(K)
             for h in candidates[k]
         }
-
-        # leg1[k, r, h] = 1: робот r везёт груз k от A до h
         leg1 = {
             (k, r, h): model.NewBoolVar(f"l1_{k}_{r}_{h}")
             for k in range(K)
             for r in range(R)
             for h in candidates[k]
         }
-
-        # leg2[k, r, h] = 1: робот r везёт груз k от h до B
         leg2 = {
             (k, r, h): model.NewBoolVar(f"l2_{k}_{r}_{h}")
             for k in range(K)
@@ -289,7 +272,13 @@ class GraphHandoffCpSatSolver:
             for h in candidates[k]
         }
 
-        for k in range(K):
+        # Временные интервалы выполнения задач
+        t_start = [model.NewIntVar(0, max_horizon, f"ts_{k}") for k in range(K)]
+        t_dur = [model.NewIntVar(0, max_horizon, f"td_{k}") for k in range(K)]
+        t_end = [model.NewIntVar(0, max_horizon, f"te_{k}") for k in range(K)]
+
+        for k, task in enumerate(tasks):
+            A, B = task.start_vertex, task.finish_vertex
             if not allow_undelivered:
                 model.Add(delivered[k] == 1)
 
@@ -307,7 +296,69 @@ class GraphHandoffCpSatSolver:
                 for r in range(R):
                     model.Add(leg1[k, r, h] + leg2[k, r, h] <= relay_h[k, h])
 
-        # Ограничение по батарее (строго линейно: BoolVar * int)
+            dur_terms = []
+            if self.dist[A][B] < INF:
+                dur_terms.append(sum(direct[k, r] for r in range(R)) * self.dist[A][B])
+            for h in candidates[k]:
+                d_split = self.dist[A][h] + self.dist[h][B]
+                dur_terms.append(relay_h[k, h] * d_split)
+
+            model.Add(t_dur[k] == sum(dur_terms))
+            model.Add(t_end[k] == t_start[k] + t_dur[k])
+
+            # Время выезда со стартовой позиции робота к первой задаче
+            for r, r_spec in enumerate(robots):
+                if self.dist[r_spec.start_vertex][A] < INF:
+                    model.Add(
+                        t_start[k] >= self.dist[r_spec.start_vertex][A]
+                    ).OnlyEnforceIf(direct[k, r])
+                    for h in candidates[k]:
+                        model.Add(
+                            t_start[k] >= self.dist[r_spec.start_vertex][A]
+                        ).OnlyEnforceIf(leg1[k, r, h])
+
+        # Дизъюнкции: последовательность задач на каждом роботе с учётом перехода
+        for r in range(R):
+            for j in range(K):
+                for k in range(j + 1, K):
+                    task_j = tasks[j]
+                    task_k = tasks[k]
+
+                    # Участвует ли робот r в задаче j и задаче k?
+                    in_j = [direct[j, r]] + [leg1[j, r, h] for h in candidates[j]] + [
+                        leg2[j, r, h] for h in candidates[j]
+                    ]
+                    in_k = [direct[k, r]] + [leg1[k, r, h] for h in candidates[k]] + [
+                        leg2[k, r, h] for h in candidates[k]
+                    ]
+
+                    r_in_j = model.NewBoolVar(f"r{r}_in_{j}")
+                    r_in_k = model.NewBoolVar(f"r{r}_in_{k}")
+                    model.Add(sum(in_j) == r_in_j)
+                    model.Add(sum(in_k) == r_in_k)
+
+                    both = model.NewBoolVar(f"both_r{r}_{j}_{k}")
+                    model.AddBoolAnd([r_in_j, r_in_k]).OnlyEnforceIf(both)
+                    model.AddBoolOr([r_in_j.Not(), r_in_k.Not()]).OnlyEnforceIf(both.Not())
+
+                    j_before_k = model.NewBoolVar(f"ord_r{r}_{j}_{k}")
+
+                    # Оценка дистанции переезда от сдачи j до забора k
+                    d_jk = self.dist[task_j.finish_vertex][task_k.start_vertex]
+                    d_kj = self.dist[task_k.finish_vertex][task_j.start_vertex]
+                    if d_jk >= INF:
+                        d_jk = 0
+                    if d_kj >= INF:
+                        d_kj = 0
+
+                    model.Add(t_start[k] >= t_end[j] + d_jk).OnlyEnforceIf(
+                        [both, j_before_k]
+                    )
+                    model.Add(t_start[j] >= t_end[k] + d_kj).OnlyEnforceIf(
+                        [both, j_before_k.Not()]
+                    )
+
+        # Ограничения батареи
         for r, r_spec in enumerate(robots):
             energy_terms = []
             for k, task in enumerate(tasks):
@@ -322,9 +373,16 @@ class GraphHandoffCpSatSolver:
 
             model.Add(sum(energy_terms) <= r_spec.battery)
 
+        # РЕАЛЬНЫЙ makespan: верхняя граница окончания всех доставленных задач
         makespan = model.NewIntVar(0, max_horizon, "makespan")
+        for k in range(K):
+            model.Add(makespan >= t_end[k]).OnlyEnforceIf(delivered[k])
+
         num_delivered = sum(delivered)
-        model.Maximize(num_delivered * 10000 - makespan * 100)
+        # Приоритет: 1) Максимум доставленных, 2) Минимум makespan (балансировка!), 3) Экономия пути
+        model.Minimize(
+            (K - num_delivered) * 1_000_000 + makespan * 1000 + sum(t_dur)
+        )
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_s
@@ -336,6 +394,9 @@ class GraphHandoffCpSatSolver:
         plan_tasks = []
         for k, task in enumerate(tasks):
             if solver.BooleanValue(delivered[k]):
+                start_t_val = solver.Value(t_start[k])
+                end_t_val = solver.Value(t_end[k])
+
                 is_dir = False
                 for r in range(R):
                     if solver.BooleanValue(direct[k, r]):
@@ -349,6 +410,8 @@ class GraphHandoffCpSatSolver:
                                 "r1": r,
                                 "r2": None,
                                 "handoff_v": None,
+                                "t_start": start_t_val,
+                                "t_end": end_t_val,
                             }
                         )
                         is_dir = True
@@ -367,6 +430,7 @@ class GraphHandoffCpSatSolver:
                                 for r in range(R)
                                 if solver.BooleanValue(leg2[k, r, h])
                             )
+                            t_mid = start_t_val + self.dist[task.start_vertex][h]
                             plan_tasks.append(
                                 {
                                     "task_id": task.task_id,
@@ -377,6 +441,9 @@ class GraphHandoffCpSatSolver:
                                     "r1": r1,
                                     "r2": r2,
                                     "handoff_v": h,
+                                    "t_start": start_t_val,
+                                    "t_mid": t_mid,
+                                    "t_end": end_t_val,
                                 }
                             )
                             break
@@ -400,37 +467,50 @@ class GraphHandoffCpSatSolver:
         R = len(robots)
         scheduled_tasks = high_level["tasks"]
 
-        robot_legs: Dict[int, List[dict]] = {r: [] for r in range(R)}
+        # Формируем этапы
+        all_legs = []
         for item in scheduled_tasks:
             if not item["relay"]:
-                robot_legs[item["r1"]].append(
+                all_legs.append(
                     {
-                        "type": "direct",
                         "task_id": item["task_id"],
+                        "carrier": item["r1"],
                         "pickup": item["start"],
                         "dropoff": item["finish"],
+                        "type": "direct",
                         "partner": None,
+                        "t_est_start": item["t_start"],
+                        "t_est_end": item["t_end"],
                     }
                 )
             else:
-                robot_legs[item["r1"]].append(
+                all_legs.append(
                     {
-                        "type": "handoff_drop",
                         "task_id": item["task_id"],
+                        "carrier": item["r1"],
                         "pickup": item["start"],
                         "dropoff": item["handoff_v"],
+                        "type": "handoff_drop",
                         "partner": item["r2"],
+                        "t_est_start": item["t_start"],
+                        "t_est_end": item["t_mid"],
                     }
                 )
-                robot_legs[item["r2"]].append(
+                all_legs.append(
                     {
-                        "type": "handoff_pickup",
                         "task_id": item["task_id"],
+                        "carrier": item["r2"],
                         "pickup": item["handoff_v"],
                         "dropoff": item["finish"],
+                        "type": "handoff_pickup",
                         "partner": item["r1"],
+                        "t_est_start": item["t_mid"],
+                        "t_est_end": item["t_end"],
                     }
                 )
+
+        # Сортируем этапы строго по времени начала (хронологический порядок)
+        all_legs.sort(key=lambda leg: leg["t_est_start"])
 
         constraints: Set[Tuple[int, int, int]] = set()
         cbs_queue = [(0, 0, constraints)]
@@ -439,8 +519,8 @@ class GraphHandoffCpSatSolver:
         while cbs_queue and (time.time() - start_time) < time_limit_s:
             _, _, cur_constraints = heapq.heappop(cbs_queue)
 
-            plan_res = self._plan_all_robots(
-                robots, robot_legs, cur_constraints, max_horizon, blocked
+            plan_res = self._plan_all_robots_chronological(
+                robots, all_legs, cur_constraints, max_horizon, blocked
             )
             if plan_res is None:
                 continue
@@ -468,14 +548,15 @@ class GraphHandoffCpSatSolver:
             solver_status="TIMEOUT",
         )
 
-    def _plan_all_robots(
+    def _plan_all_robots_chronological(
         self,
         robots: List[RobotSpec],
-        robot_legs: Dict[int, List[dict]],
+        all_legs: List[dict],
         constraints: Set[Tuple[int, int, int]],
         max_horizon: int,
         blocked: Dict[int, int],
     ) -> Optional[Tuple[Dict[int, List[int]], Dict[int, List[Optional[int]]]]]:
+        """Синхронное пошаговое выполнение этапов с rendezvous в точках эстафеты."""
         R = len(robots)
         paths: Dict[int, List[int]] = {r: [robots[r].start_vertex] for r in range(R)}
         batt: Dict[int, List[int]] = {r: [robots[r].battery] for r in range(R)}
@@ -484,82 +565,73 @@ class GraphHandoffCpSatSolver:
             (robots[r].start_vertex, 0): 1 for r in range(R)
         }
 
-        legs_queue = {r: list(robot_legs[r]) for r in range(R)}
-        current_leg = {r: legs_queue[r].pop(0) if legs_queue[r] else None for r in range(R)}
-        handoff_arrival: Dict[Tuple[int, int], int] = {}
+        handoff_events_arrival: Dict[Tuple[int, int], int] = {}
 
-        deadlock_guard = 0
-        while any(current_leg.values()) and deadlock_guard < max_horizon * 2:
-            deadlock_guard += 1
-            progress = False
+        for leg in all_legs:
+            r = leg["carrier"]
+            curr_t = len(paths[r]) - 1
+            curr_v = paths[r][-1]
+            curr_b = batt[r][-1]
 
-            for r in range(R):
-                leg = current_leg[r]
-                if leg is None:
-                    continue
+            if leg["type"] == "handoff_pickup":
+                key = (leg["task_id"], leg["pickup"])
+                t_partner_arr = handoff_events_arrival.get(key, 0)
 
+                # Путь до точки встречи
+                p_to_meet = SpaceTimeAStar.plan(
+                    r,
+                    curr_v,
+                    curr_t,
+                    curr_b,
+                    leg["pickup"],
+                    t_partner_arr,
+                    max_horizon,
+                    self.adj,
+                    self.dist,
+                    constraints,
+                    reservation,
+                    self.max_robots_per_vertex,
+                    blocked,
+                )
+                if p_to_meet is None:
+                    return None
+                self._apply_subpath(r, p_to_meet, None, paths, batt, task_held, reservation)
                 curr_t = len(paths[r]) - 1
                 curr_v = paths[r][-1]
                 curr_b = batt[r][-1]
 
-                if leg["type"] == "handoff_pickup":
-                    key = (leg["task_id"], leg["pickup"])
-                    if key not in handoff_arrival:
-                        if curr_t < max_horizon:
-                            self._append_wait(r, paths, batt, task_held, reservation)
-                            progress = True
-                        continue
+                # Синхронизация встречи: если приехал раньше напарника, ждёт в точке
+                t_meet = max(curr_t, t_partner_arr)
+                while curr_t < t_meet:
+                    self._append_wait(r, paths, batt, task_held, reservation)
+                    curr_t += 1
 
-                    meet_t = handoff_arrival[key]
-                    if curr_t < meet_t or curr_v != leg["pickup"]:
-                        p = SpaceTimeAStar.plan(
-                            r,
-                            curr_v,
-                            curr_t,
-                            curr_b,
-                            leg["pickup"],
-                            meet_t,
-                            max_horizon,
-                            self.adj,
-                            self.dist,
-                            constraints,
-                            reservation,
-                            self.max_robots_per_vertex,
-                            blocked,
-                        )
-                        if p is None:
-                            return None
-                        self._apply_subpath(r, p, None, paths, batt, task_held, reservation)
-                        curr_t = len(paths[r]) - 1
-                        curr_v = paths[r][-1]
-                        curr_b = batt[r][-1]
+                # Доставка груза до финиша
+                p_deliv = SpaceTimeAStar.plan(
+                    r,
+                    curr_v,
+                    curr_t,
+                    curr_b,
+                    leg["dropoff"],
+                    curr_t + 1,
+                    max_horizon,
+                    self.adj,
+                    self.dist,
+                    constraints,
+                    reservation,
+                    self.max_robots_per_vertex,
+                    blocked,
+                )
+                if p_deliv is None:
+                    return None
+                self._apply_subpath(
+                    r, p_deliv, leg["task_id"], paths, batt, task_held, reservation
+                )
 
-                    p_drop = SpaceTimeAStar.plan(
-                        r,
-                        curr_v,
-                        curr_t,
-                        curr_b,
-                        leg["dropoff"],
-                        curr_t + 1,
-                        max_horizon,
-                        self.adj,
-                        self.dist,
-                        constraints,
-                        reservation,
-                        self.max_robots_per_vertex,
-                        blocked,
-                    )
-                    if p_drop is None:
-                        return None
-                    self._apply_subpath(
-                        r, p_drop, leg["task_id"], paths, batt, task_held, reservation
-                    )
-                    current_leg[r] = legs_queue[r].pop(0) if legs_queue[r] else None
-                    progress = True
-                    continue
-
+            else:
+                # Прямая доставка или первый этап эстафеты (handoff_drop)
                 if curr_v != leg["pickup"]:
-                    p_pick = SpaceTimeAStar.plan(
+                    p_to_pick = SpaceTimeAStar.plan(
                         r,
                         curr_v,
                         curr_t,
@@ -574,9 +646,11 @@ class GraphHandoffCpSatSolver:
                         self.max_robots_per_vertex,
                         blocked,
                     )
-                    if p_pick is None:
+                    if p_to_pick is None:
                         return None
-                    self._apply_subpath(r, p_pick, None, paths, batt, task_held, reservation)
+                    self._apply_subpath(
+                        r, p_to_pick, None, paths, batt, task_held, reservation
+                    )
                     curr_t = len(paths[r]) - 1
                     curr_v = paths[r][-1]
                     curr_b = batt[r][-1]
@@ -603,17 +677,11 @@ class GraphHandoffCpSatSolver:
                 )
 
                 if leg["type"] == "handoff_drop":
-                    handoff_arrival[(leg["task_id"], leg["dropoff"])] = len(paths[r]) - 1
+                    handoff_events_arrival[(leg["task_id"], leg["dropoff"])] = (
+                        len(paths[r]) - 1
+                    )
 
-                current_leg[r] = legs_queue[r].pop(0) if legs_queue[r] else None
-                progress = True
-
-            if not progress:
-                min_len = min(len(paths[r]) for r in range(R))
-                for r in range(R):
-                    if len(paths[r]) == min_len and len(paths[r]) <= max_horizon:
-                        self._append_wait(r, paths, batt, task_held, reservation)
-
+        # Выравниваем по длине все траектории до единого глобального makespan
         max_T = max(len(paths[r]) for r in range(R))
         for r in range(R):
             while len(paths[r]) < max_T:
@@ -703,7 +771,6 @@ class GraphHandoffCpSatSolver:
 
 
 def print_passport_output(result: ScheduleResult) -> None:
-    """Форматированный вывод согласно контракту из Паспорта проекта."""
     if not result.success:
         print(f"Решение не найдено (статус: {result.solver_status})")
         return
@@ -723,7 +790,6 @@ def print_passport_output(result: ScheduleResult) -> None:
 
 
 def print_output(result: ScheduleResult) -> None:
-    """Форматированный вывод: номер_робота следующая_вершина задача."""
     if not result.success:
         print(f"Решение не найдено (статус: {result.solver_status})")
         return
@@ -736,7 +802,6 @@ def print_output(result: ScheduleResult) -> None:
 
 
 def prepare_data(graph: Dict, raw_tasks: List[Dict], default_battery: int = 30):
-    """Адаптирует сырые данные генератора под запуск решателя."""
     num_vertices = len(graph)
     edges = []
     for u, neighbors in graph.items():

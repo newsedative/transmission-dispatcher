@@ -6,9 +6,10 @@ test_run.py
    с расчетом POI-дистанций, сбалансированным Warm-Start (Min-Load Round-Robin)
    и точной минимизацией makespan.
 2. Нижний уровень (CBS + Space-Time A*): потактовое хронологическое планирование
-   с точной эвристикой, синхронизацией эстафет и контролем вместимости (<= 2).
+   с точной эвристикой, синхронизацией эстафет и полноценным Conflict-Based Search
+   по вместимости вершин (<= 2).
 
-Оптимизирован для сеток 128x128 и более (V > 16 000).
+Оптимизирован как для малых эталонов (passport), так и для сеток 128x128 (V > 16 000).
 Полностью совместим с failure.py и visualize.py.
 """
 
@@ -85,7 +86,7 @@ class DistanceOracle:
 
 
 class SpaceTimeAStar:
-    """Низкоуровневый планировщик пути робота с точной BFS-эвристикой."""
+    """Низкоуровневый планировщик пути робота с точной BFS-эвристикой для CBS."""
 
     @staticmethod
     def plan(
@@ -99,7 +100,6 @@ class SpaceTimeAStar:
         adj: Dict[int, List[int]],
         dist_oracle: DistanceOracle,
         constraints: Set[Tuple[int, int, int]],
-        reservation: Dict[Tuple[int, int], int],
         max_capacity: int,
         blocked_vertices: Dict[int, int],
     ) -> Optional[List[Tuple[int, int]]]:
@@ -129,11 +129,12 @@ class SpaceTimeAStar:
                 if next_batt < 0:
                     continue
 
+                # Ограничение CBS для данного робота
                 if (robot_id, v, next_t) in constraints:
                     continue
 
-                cap_limit = max_capacity - blocked_vertices.get(v, 0)
-                if reservation.get((v, next_t), 0) >= cap_limit:
+                # Полностью заблокированная вершина
+                if blocked_vertices.get(v, 0) >= max_capacity:
                     continue
 
                 counter += 1
@@ -198,9 +199,6 @@ class GraphHandoffCpSatSolver:
                 solver_status="OPTIMAL",
             )
 
-        # ---------------------------------------------------------------------
-        # 1. Верхний уровень (CP-SAT): распределение задач и окон
-        # ---------------------------------------------------------------------
         elapsed = time.time() - start_time
         cp_time_budget = max(5.0, (time_limit_s - elapsed) * 0.7)
 
@@ -222,9 +220,6 @@ class GraphHandoffCpSatSolver:
                 solver_status=high_level_plan["status"],
             )
 
-        # ---------------------------------------------------------------------
-        # 2. Нижний уровень (CBS + Space-Time A*): потактовые траектории
-        # ---------------------------------------------------------------------
         remaining_time = max(2.0, time_limit_s - (time.time() - start_time))
         low_level_result = self._solve_low_level_cbs(
             robots,
@@ -265,7 +260,6 @@ class GraphHandoffCpSatSolver:
         task_count = [0] * R
         max_tasks_per_robot = math.ceil(K / R) + 1
 
-        # Сортируем задачи: сначала самые длинные (их важно распределить первыми)
         sorted_k = sorted(
             range(K),
             key=lambda k: self.oracle.dist(tasks[k].start_vertex, tasks[k].finish_vertex),
@@ -286,8 +280,10 @@ class GraphHandoffCpSatSolver:
                 d_pick = self.oracle.dist(cur_pos[r], A)
                 if d_pick >= INF:
                     continue
+                # Проверяем, хватит ли роботу батареи на прямую доставку
+                if d_AB > robots[r].battery:
+                    continue
                 t_fin = avail_t[r] + d_pick + d_AB
-                # Приоритет роботам с наименьшей занятостью
                 penalty = 300 if task_count[r] >= max_tasks_per_robot else 0
                 score = t_fin + penalty + avail_t[r] * 0.4
 
@@ -304,7 +300,7 @@ class GraphHandoffCpSatSolver:
             else:
                 greedy_assigned[k] = 0
 
-        # 3. Load-Aware Spatial Pruning: кандидат из warm-start + ближайшие
+        # 3. Load-Aware Spatial Pruning
         cand_robots: Dict[int, List[int]] = {}
         c_limit = min(R, max(5, int(math.ceil(R * 0.25))))
         for k, task in enumerate(tasks):
@@ -313,7 +309,10 @@ class GraphHandoffCpSatSolver:
                 range(R),
                 key=lambda r: (
                     0 if r == assigned_r else 1,
-                    self.oracle.dist(robots[r].start_vertex, task.start_vertex),
+                    min(
+                        self.oracle.dist(robots[r].start_vertex, task.start_vertex),
+                        self.oracle.dist(robots[r].start_vertex, task.finish_vertex),
+                    ),
                 ),
             )
             cand_robots[k] = ranked[:c_limit]
@@ -324,7 +323,8 @@ class GraphHandoffCpSatSolver:
             A, B = task.start_vertex, task.finish_vertex
             d_AB = self.oracle.dist(A, B)
             cands = []
-            if d_AB < INF and d_AB > 4:
+            needs_relay = d_AB >= 2 and (d_AB > 4 or any(r.battery < d_AB for r in robots))
+            if needs_relay and d_AB < INF:
                 d_A = self.oracle.get_all_from(A)
                 d_B = self.oracle.get_all_from(B)
                 mid_target = d_AB // 2
@@ -336,7 +336,7 @@ class GraphHandoffCpSatSolver:
                             balance = abs(d1 - mid_target)
                             cands.append((balance, v))
                 cands.sort()
-                candidates[k] = [v for _, v in cands[:4]]
+                candidates[k] = [v for _, v in cands[:6]]
             else:
                 candidates[k] = []
 
@@ -405,7 +405,7 @@ class GraphHandoffCpSatSolver:
                     for h in candidates[k]:
                         model.Add(t_start[k] >= d_init).OnlyEnforceIf(leg1[k, r, h])
 
-        # 6. Дизъюнкции переходов между задачами
+        # 6. Дизъюнкции переходов
         tasks_for_robot: Dict[int, List[int]] = {r: [] for r in range(R)}
         for k in range(K):
             for r in cand_robots[k]:
@@ -471,11 +471,13 @@ class GraphHandoffCpSatSolver:
         num_delivered = sum(delivered)
         model.Minimize((K - num_delivered) * 1_000_000 + makespan * 1000 + sum(t_dur))
 
-        # 8. Непротиворечивые хинты (AddHint) цепочек по роботам
+        # 8. Хинты для прямо доставляемых задач (только если батарея позволяет)
         robot_tasks_order: Dict[int, List[int]] = {r: [] for r in range(R)}
         for k in range(K):
             if k in greedy_assigned:
-                robot_tasks_order[greedy_assigned[k]].append(k)
+                r_cand = greedy_assigned[k]
+                if self.oracle.dist(tasks[k].start_vertex, tasks[k].finish_vertex) <= robots[r_cand].battery:
+                    robot_tasks_order[r_cand].append(k)
 
         greedy_ms = 0
         for r in range(R):
@@ -498,7 +500,8 @@ class GraphHandoffCpSatSolver:
                 p_now = B
             greedy_ms = max(greedy_ms, t_now)
 
-        model.AddHint(makespan, min(max_horizon, greedy_ms))
+        if greedy_ms > 0:
+            model.AddHint(makespan, min(max_horizon, greedy_ms))
 
         # 9. Решение
         solver = cp_model.CpSolver()
@@ -675,11 +678,8 @@ class GraphHandoffCpSatSolver:
         paths: Dict[int, List[int]] = {r: [robots[r].start_vertex] for r in range(R)}
         batt: Dict[int, List[int]] = {r: [robots[r].battery] for r in range(R)}
         task_held: Dict[int, List[Optional[int]]] = {r: [None] for r in range(R)}
-        reservation: Dict[Tuple[int, int], int] = {
-            (robots[r].start_vertex, 0): 1 for r in range(R)
-        }
 
-        handoff_events_arrival: Dict[Tuple[int, int], int] = {}
+        handoff_drops: Dict[Tuple[int, int], Tuple[int, int]] = {}
 
         for leg in all_legs:
             r = leg["carrier"]
@@ -689,35 +689,45 @@ class GraphHandoffCpSatSolver:
 
             if leg["type"] == "handoff_pickup":
                 key = (leg["task_id"], leg["pickup"])
-                t_partner_arr = handoff_events_arrival.get(key, 0)
+                partner_r, t_partner_arr = handoff_drops[key]
 
-                p_to_meet = SpaceTimeAStar.plan(
+                # Приезд принимающего робота в узел встречи
+                p_to_pick = SpaceTimeAStar.plan(
                     r,
                     curr_v,
                     curr_t,
                     curr_b,
                     leg["pickup"],
-                    t_partner_arr,
+                    curr_t,
                     max_horizon,
                     self.adj,
                     self.oracle,
                     constraints,
-                    reservation,
                     self.max_robots_per_vertex,
                     blocked,
                 )
-                if p_to_meet is None:
+                if p_to_pick is None:
                     return None
-                self._apply_subpath(r, p_to_meet, None, paths, batt, task_held, reservation)
+                self._apply_subpath(r, p_to_pick, None, paths, batt, task_held)
                 curr_t = len(paths[r]) - 1
                 curr_v = paths[r][-1]
                 curr_b = batt[r][-1]
 
+                # Точное время встречи: максимум из прибытия обоих роботов
                 t_meet = max(curr_t, t_partner_arr)
+
+                # Если принимающий робот приехал раньше, он ждёт пустой
                 while curr_t < t_meet:
-                    self._append_wait(r, paths, batt, task_held, reservation)
+                    self._append_wait(r, paths, batt, task_held, None)
                     curr_t += 1
 
+                # Если робот-сдатчик приехал раньше, он ждёт с грузом на борту
+                partner_cur_t = len(paths[partner_r]) - 1
+                while partner_cur_t < t_meet:
+                    self._append_wait(partner_r, paths, batt, task_held, leg["task_id"])
+                    partner_cur_t += 1
+
+                # Доставка груза до финиша
                 p_deliv = SpaceTimeAStar.plan(
                     r,
                     curr_v,
@@ -729,17 +739,17 @@ class GraphHandoffCpSatSolver:
                     self.adj,
                     self.oracle,
                     constraints,
-                    reservation,
                     self.max_robots_per_vertex,
                     blocked,
                 )
                 if p_deliv is None:
                     return None
                 self._apply_subpath(
-                    r, p_deliv, leg["task_id"], paths, batt, task_held, reservation
+                    r, p_deliv, leg["task_id"], paths, batt, task_held
                 )
 
             else:
+                # Прямая доставка или первый этап эстафеты (handoff_drop)
                 if curr_v != leg["pickup"]:
                     p_to_pick = SpaceTimeAStar.plan(
                         r,
@@ -752,14 +762,13 @@ class GraphHandoffCpSatSolver:
                         self.adj,
                         self.oracle,
                         constraints,
-                        reservation,
                         self.max_robots_per_vertex,
                         blocked,
                     )
                     if p_to_pick is None:
                         return None
                     self._apply_subpath(
-                        r, p_to_pick, None, paths, batt, task_held, reservation
+                        r, p_to_pick, None, paths, batt, task_held
                     )
                     curr_t = len(paths[r]) - 1
                     curr_v = paths[r][-1]
@@ -776,44 +785,41 @@ class GraphHandoffCpSatSolver:
                     self.adj,
                     self.oracle,
                     constraints,
-                    reservation,
                     self.max_robots_per_vertex,
                     blocked,
                 )
                 if p_carry is None:
                     return None
                 self._apply_subpath(
-                    r, p_carry, leg["task_id"], paths, batt, task_held, reservation
+                    r, p_carry, leg["task_id"], paths, batt, task_held
                 )
 
                 if leg["type"] == "handoff_drop":
-                    handoff_events_arrival[(leg["task_id"], leg["dropoff"])] = (
-                        len(paths[r]) - 1
+                    handoff_drops[(leg["task_id"], leg["dropoff"])] = (
+                        r,
+                        len(paths[r]) - 1,
                     )
 
+        # Выравнивание траекторий
         max_T = max(len(paths[r]) for r in range(R))
         for r in range(R):
             while len(paths[r]) < max_T:
-                self._append_wait(r, paths, batt, task_held, reservation)
+                self._append_wait(r, paths, batt, task_held, None)
 
         return paths, task_held
 
-    def _append_wait(self, r, paths, batt, task_held, reservation):
+    def _append_wait(self, r, paths, batt, task_held, val=None):
         v = paths[r][-1]
         b = batt[r][-1]
-        t = len(paths[r])
         paths[r].append(v)
         batt[r].append(b)
-        task_held[r].append(None)
-        reservation[(v, t)] = reservation.get((v, t), 0) + 1
+        task_held[r].append(val)
 
-    def _apply_subpath(self, r, subpath, carried_task, paths, batt, task_held, reservation):
+    def _apply_subpath(self, r, subpath, carried_task, paths, batt, task_held):
         for v, b in subpath[1:]:
-            t = len(paths[r])
             paths[r].append(v)
             batt[r].append(b)
             task_held[r].append(carried_task)
-            reservation[(v, t)] = reservation.get((v, t), 0) + 1
 
     def _find_vertex_conflict(
         self, paths: Dict[int, List[int]], blocked: Dict[int, int]

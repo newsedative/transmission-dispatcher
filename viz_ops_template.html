@@ -118,9 +118,29 @@ select {
 @media (max-width: 720px) { .floor { height: 420px; } }
 .floor canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: default; }
 .hint {
-  position: absolute; top: 10px; right: 12px; font-size: 11px; color: var(--muted); letter-spacing: 0.04em;
+  font-size: 11px; color: var(--muted); letter-spacing: 0.04em;
   background: rgba(4, 12, 17, 0.7); padding: 4px 8px; border-radius: 4px; border: 1px solid var(--line);
 }
+@media (max-width: 900px) { .hint { display: none; } }
+.ftools { position: absolute; top: 10px; right: 12px; display: flex; align-items: center; gap: 6px; }
+.tb {
+  width: 30px; height: 30px; display: grid; place-items: center; padding: 0; cursor: pointer;
+  background: rgba(4, 12, 17, 0.85); color: var(--cyan); border: 1px solid var(--line-hi); border-radius: 5px;
+  font-family: var(--mono); font-size: 15px; font-weight: 600; line-height: 1;
+}
+.tb:hover { border-color: var(--cyan); }
+.tb:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+.zoomv { font-family: var(--mono); font-size: 11px; color: var(--muted); min-width: 4.5ch; text-align: right; }
+.floor:fullscreen { height: 100vh; width: 100vw; border-radius: 0; border: 0; }
+.floor.max { position: fixed; inset: 0; z-index: 50; height: 100vh; border-radius: 0; }
+.hud {
+  display: none; position: absolute; top: 46px; left: 12px; align-items: center; gap: 10px;
+  background: rgba(4, 12, 17, 0.8); padding: 5px 10px 5px 5px; border-radius: 6px; border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 18px; color: var(--ink); font-variant-numeric: tabular-nums;
+}
+.hud .tb.on { background: rgba(63, 216, 240, 0.18); border-color: var(--cyan); }
+.floor:fullscreen .hud, .floor.max .hud { display: flex; }
+.floor.dragging canvas { cursor: grabbing !important; }
 .ftitle {
   position: absolute; top: 10px; left: 12px; font-family: var(--display); font-size: 11px; letter-spacing: 0.14em;
   text-transform: uppercase; color: var(--cyan); background: rgba(4, 12, 17, 0.7); padding: 4px 8px; border-radius: 4px;
@@ -154,6 +174,7 @@ select {
 
 /* fleet table */
 .rows { display: grid; gap: 2px; padding: 6px; }
+#fleet { max-height: 480px; overflow-y: auto; }
 .thead, .row {
   display: grid; grid-template-columns: 10px 44px minmax(0, 1fr) 46px 78px; gap: 8px; align-items: center;
 }
@@ -179,7 +200,7 @@ select {
 .bat b { font-family: var(--mono); font-size: 11px; font-weight: 600; min-width: 4ch; text-align: right; font-variant-numeric: tabular-nums; }
 .orders { padding: 8px 12px 12px; border-top: 1px solid var(--line); display: grid; gap: 8px; margin-top: auto; }
 .orders h3 { margin: 0; font-family: var(--display); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
-.ochips { display: flex; flex-wrap: wrap; gap: 5px; }
+.ochips { display: flex; flex-wrap: wrap; gap: 5px; max-height: 160px; overflow-y: auto; }
 .ord {
   font-family: var(--mono); font-size: 11px; padding: 3px 7px; border-radius: 4px; border: 1px solid var(--line-hi);
   color: var(--muted); cursor: default; white-space: nowrap;
@@ -266,7 +287,20 @@ select {
     <section class="panel floor" aria-label="Граф и роботы">
       <canvas id="cv"></canvas>
       <div class="ftitle">Карта сети</div>
-      <div class="hint">клик по роботу — его маршрут</div>
+      <div class="ftools">
+        <span class="hint">колесо — зум · тяни — сдвиг · клик по роботу — маршрут</span>
+        <span class="zoomv" id="zoomv">100%</span>
+        <button class="tb" id="zIn" type="button" aria-label="Приблизить" title="Приблизить">+</button>
+        <button class="tb" id="zOut" type="button" aria-label="Отдалить" title="Отдалить">−</button>
+        <button class="tb" id="zReset" type="button" aria-label="Показать весь граф" title="Весь граф (двойной клик по карте)">
+          <svg width="14" height="14" viewBox="0 0 14 14"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9" fill="none" stroke="currentColor" stroke-width="1.6"/><rect x="4.5" y="4.5" width="5" height="5" fill="currentColor"/></svg></button>
+        <button class="tb" id="fs" type="button" aria-label="Карта на весь экран" title="На весь экран (F)">
+          <svg id="fsIco" width="14" height="14" viewBox="0 0 14 14"><path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></button>
+      </div>
+      <div class="hud" id="hud">
+        <button class="tb" id="hPlay" type="button" aria-label="Пуск / пауза"></button>
+        <span id="hClk">00 / 00</span>
+      </div>
       <div class="alert" id="alert" role="status"><b id="alertH"></b><span id="alertS"></span></div>
       <div class="fbottom">
         <div class="legend">
@@ -322,6 +356,7 @@ let S = null, time = 0, playing = false, lastTs = null, speedIdx = 1;
 let selected = null, hoverOrder = null, lastK = -1, dragChart = false;
 const cv = $("cv"), ctx = cv.getContext("2d");
 let cw = 0, ch = 0, dpr = 1, fit = null, staticLayer = null, hits = [], vs = 1;
+let view = { z: 1, dx: 0, dy: 0 }, needStatic = false;    // zoom / pan of the map on top of the auto fit
 
 /* ------------------------------------------------------------------ data */
 function prepare(s) {
@@ -454,9 +489,13 @@ function computeFit() {
   const iso = fitFor(Math.PI / 4);
   let best = iso;
   if (iso.md < 50) for (const deg of [30, 15, 0]) { const f = fitFor(deg * Math.PI / 180); if (f.md > best.md * 1.08) best = f; }
+  const { z, dx, dy } = view;                      // screen' = z * screen + d
+  best.sc *= z; best.ox = best.ox * z + dx; best.oy = best.oy * z + dy; best.md *= z;
+  best.scr = best.scr.map(([x, y]) => [x * z + dx, y * z + dy]);
   fit = best;
   S.scr = fit.scr;
-  vs = clamp(fit.md / 78, 0.6, 1.15);
+  vs = clamp(fit.md / 78, 0.32, 1.15);
+  $("zoomv").textContent = Math.round(z * 100) + "%";
 }
 const toScr = (x, y) => { const [a, b] = fit.pr(x, y); return [fit.ox + a * fit.sc, fit.oy + b * fit.sc]; };
 function groundQuad(x, y, R0) {                     // a layout-aligned square tile on the floor, R0 = half width on screen
@@ -535,7 +574,7 @@ function buildStatic() {
   bg.addColorStop(0, "#0d2633"); bg.addColorStop(1, "#050d13");
   c.fillStyle = bg; c.fillRect(0, 0, cw, ch);
   // isometric floor grid
-  const step = 1 / Math.max(2, Math.round(fit.sc / 40));
+  const step = Math.max(1 / Math.max(2, Math.round(fit.sc / 40)), 9 / 240);
   c.lineWidth = 1;
   for (let i = -Math.ceil(4 / step); i <= Math.ceil(5 / step); i++) {
     const g = i * step;
@@ -543,14 +582,22 @@ function buildStatic() {
     seg(c, toScr(g, -4), toScr(g, 5));
     seg(c, toScr(-4, g), toScr(5, g));
   }
-  // edges: glow pass, then a bright core
+  // edges: glow pass, then a bright core. Big or dense graphs get a light version (no glow, thin lines),
+  // and only what is on screen is drawn.
+  const md = fit.md, M = 30;
+  const off = p => p[0] < -M || p[0] > cw + M || p[1] < -M || p[1] > ch + M;
+  const vis = S.edges.filter(([u, v]) => !(off(S.scr[u]) && off(S.scr[v])));
   c.lineCap = "round";
-  c.shadowColor = COL.cyan; c.shadowBlur = 14;
-  c.strokeStyle = "rgba(63,216,240,0.32)"; c.lineWidth = 5;
-  for (const [u, v] of S.edges) seg(c, S.scr[u], S.scr[v]);
-  c.shadowBlur = 0;
-  c.strokeStyle = "rgba(150,236,250,0.8)"; c.lineWidth = 1.4;
-  for (const [u, v] of S.edges) seg(c, S.scr[u], S.scr[v]);
+  if (md >= 20 && vis.length < 4000) {
+    c.shadowColor = COL.cyan; c.shadowBlur = 14;
+    c.strokeStyle = "rgba(63,216,240,0.32)"; c.lineWidth = 5;
+    for (const [u, v] of vis) seg(c, S.scr[u], S.scr[v]);
+    c.shadowBlur = 0;
+  }
+  c.strokeStyle = md < 10 ? "rgba(110,215,235,0.5)" : "rgba(150,236,250,0.8)"; c.lineWidth = md < 10 ? 1 : 1.4;
+  c.beginPath();
+  for (const [u, v] of vis) { c.moveTo(S.scr[u][0], S.scr[u][1]); c.lineTo(S.scr[v][0], S.scr[v][1]); }
+  c.stroke();
   if (S.show_weights && S.edges.length <= 120 && fit.md >= 54) {
     c.font = "600 10px 'JetBrains Mono', monospace"; c.textAlign = "center"; c.textBaseline = "middle";
     for (const [u, v, w] of S.edges) {
@@ -561,14 +608,16 @@ function buildStatic() {
     }
   }
   // nodes
-  const nr = 10 * vs;
-  for (let v = 0; v < S.n; v++) {
+  const nr = Math.min(10 * vs, md * 0.3), glow = md >= 34, labels = md >= 34;
+  if (md >= 18) for (let v = 0; v < S.n; v++) {
     const [x, y] = S.scr[v];
-    c.shadowColor = COL.cyan; c.shadowBlur = 12;
+    if (off(S.scr[v])) continue;
+    c.shadowColor = COL.cyan; c.shadowBlur = glow ? 12 : 0;
     ellipse(c, x, y, nr, nr / 2); c.fillStyle = "#081820"; c.fill();
     c.strokeStyle = "rgba(63,216,240,0.95)"; c.lineWidth = 2; c.stroke();
     c.shadowBlur = 0;
     ellipse(c, x, y, nr * 0.42, nr * 0.21); c.fillStyle = "rgba(150,236,250,0.85)"; c.fill();
+    if (!labels) continue;
     c.font = "500 10px 'JetBrains Mono', monospace"; c.textAlign = "left"; c.textBaseline = "alphabetic";
     c.fillStyle = "rgba(125,149,161,0.95)"; c.fillText(S.L(v), x + nr + 3, y + nr * 0.9);
   }
@@ -653,7 +702,7 @@ function draw(now) {
     const pts = [rp[r]];
     for (let t = k + 1; t <= PT; t++) { const v = P[r][t]; if (v !== P[r][t - 1]) pts.push(S.scr[v]); }
     if (pts.length < 2) continue;
-    const off = (r - (S.R - 1) / 2) * 3;
+    const off = (r - (S.R - 1) / 2) * Math.min(3, fit.md * 0.5 / S.R);
     ctx.strokeStyle = hexA(rc(r), selected === r ? 0.95 : dim(r) ? 0.1 : 0.42);
     ctx.lineWidth = selected === r ? 3 : 2.2;
     ctx.shadowColor = rc(r); ctx.shadowBlur = selected === r ? 10 : 4;
@@ -673,7 +722,7 @@ function draw(now) {
       const pts = [S.scr[F.orig_pos[r][F.t]]];
       for (let t = F.t + 1; t <= F.orig_T; t++) { const v = F.orig_pos[r][t]; if (v !== F.orig_pos[r][t - 1]) pts.push(S.scr[v]); }
       if (pts.length < 2) continue;
-      const off = (r - (S.R - 1) / 2) * 3;
+      const off = (r - (S.R - 1) / 2) * Math.min(3, fit.md * 0.5 / S.R);
       ctx.strokeStyle = hexA(COL.red, a * (r === F.r ? 0.85 : 0.45));
       for (let i = 0; i + 1 < pts.length; i++) {
         const [p0, p1] = [pts[i], pts[i + 1]], dx = p1[0] - p0[0], dy = p1[1] - p0[1], L = Math.hypot(dx, dy) || 1;
@@ -728,12 +777,14 @@ function draw(now) {
     else (done.get(b) || done.set(b, []).get(b)).push(o);
   });
   ctx.textAlign = "left";
+  const lab = fit.md >= 22;                       // dense map: markers only, no text
   for (const [v, os] of tgt) {
     const [x, y] = S.scr[v], R0 = 19 * vs, hot = hoverOrder !== null && os.includes(hoverOrder);
     const gq = groundQuad(x, y, R0);
     ctx.setLineDash([4, 3]);
     poly(ctx, gq, hot ? hexA(COL.parcel, 0.18) : null, hexA(COL.parcel, hot ? 1 : 0.6), 1.4);
     ctx.setLineDash([]);
+    if (!lab) continue;
     ctx.font = "600 10px 'JetBrains Mono', monospace"; ctx.textAlign = "right"; ctx.fillStyle = hexA(COL.parcel, 0.85);
     ctx.fillText("→" + os.map(o => "#" + oid(o)).join(","), x - R0 - 3, y + 4);
   }
@@ -742,12 +793,14 @@ function draw(now) {
     ctx.shadowColor = COL.green; ctx.shadowBlur = 10;
     poly(ctx, groundQuad(x, y, R0), hexA(COL.green, 0.22), hexA(COL.green, 0.9), 1.4);
     ctx.shadowBlur = 0;
+    if (!lab) continue;
     ctx.font = "600 10px 'JetBrains Mono', monospace"; ctx.textAlign = "right"; ctx.fillStyle = COL.green;
     ctx.fillText("✓" + os.map(o => "#" + oid(o)).join(","), x - R0 - 3, y - 6);
   }
   for (const [v, os] of wait) {
     const [x, y] = S.scr[v];
     os.forEach((o, i) => cube(ctx, x + 20 * vs, y - 2 - i * 8 * vs, 6.5 * vs, 6.5 * vs, hoverOrder === o || i === os.length - 1));
+    if (!lab) continue;
     ctx.font = "600 10px 'JetBrains Mono', monospace"; ctx.textAlign = "left"; ctx.fillStyle = COL.parcel;
     ctx.fillText(os.map(o => "#" + oid(o)).join(","), x + 29 * vs, y - 6 - (os.length - 1) * 8 * vs);
   }
@@ -811,11 +864,13 @@ function draw(now) {
   ctx.font = `600 ${bf}px 'JetBrains Mono', monospace`;
   const placed = [];
   for (const r of [...order].reverse()) {
+    if (rp[r][0] < -20 || rp[r][0] > cw + 20 || rp[r][1] < -20 || rp[r][1] > ch + 40) continue;   // off screen when zoomed
     const used = S.used[r][k] + (k < T ? S.stepE[r][k] * e : 0), cap = S.robots[r][1];
     const pct = cap ? clamp((cap - used) / cap * 100, 0, 100) : 0, dead = S.stuck[r][Math.min(k + (p > 0.99 ? 1 : 0), T)];
     const br = S.broken[r][k], id = rid(r), txt = br ? "ОТКАЗ" : Math.round(pct) + "%";
+    const compact = fit.md < 30 && S.R > 6 && selected !== r;     // crowded map: id only
     const w1 = ctx.measureText(id).width, w2 = ctx.measureText(txt).width;
-    const W = 7 + w1 + 7 + 15 + 4 + w2 + 7, Hh = bf + 9;
+    const W = compact ? 7 + w1 + 7 : 7 + w1 + 7 + 15 + 4 + w2 + 7, Hh = bf + 9;
     let bx = rp[r][0] - W / 2, by = rp[r][1] - 52 * vs - Hh;
     for (let tries = 0; tries < 6; tries++) {
       const hit = placed.find(b => bx < b.x + b.w + 4 && bx + W + 4 > b.x && by < b.y + b.h + 3 && by + Hh + 3 > b.y);
@@ -833,11 +888,13 @@ function draw(now) {
     ctx.strokeStyle = lc; ctx.lineWidth = 1.2; ctx.stroke(); ctx.shadowBlur = 0;
     ctx.textAlign = "left"; ctx.textBaseline = "middle";
     ctx.fillStyle = rc(r); ctx.fillText(id, bx + 7, by + Hh / 2 + 0.5);
-    const ix = bx + 7 + w1 + 7, iy = by + Hh / 2 - 4;
-    ctx.strokeStyle = lc; ctx.lineWidth = 1.2; ctx.strokeRect(ix, iy, 12, 8);
-    ctx.fillStyle = lc; ctx.fillRect(ix + 12, iy + 2.5, 1.8, 3);
-    ctx.fillRect(ix + 1.5, iy + 1.5, 9 * pct / 100, 5);
-    ctx.fillText(txt, ix + 15 + 4, by + Hh / 2 + 0.5);
+    if (!compact) {
+      const ix = bx + 7 + w1 + 7, iy = by + Hh / 2 - 4;
+      ctx.strokeStyle = lc; ctx.lineWidth = 1.2; ctx.strokeRect(ix, iy, 12, 8);
+      ctx.fillStyle = lc; ctx.fillRect(ix + 12, iy + 2.5, 1.8, 3);
+      ctx.fillRect(ix + 1.5, iy + 1.5, 9 * pct / 100, 5);
+      ctx.fillText(txt, ix + 15 + 4, by + Hh / 2 + 0.5);
+    }
     if (selected === r) {
       const [st, sc] = rstatus(r, k), hh = S.hold[r][k];
       const line = (st + (hh !== null && hh !== undefined ? ` · везёт #${oid(hh)}` : "")).toUpperCase();
@@ -902,6 +959,7 @@ function updatePanels() {
   lastK = k;
   const known = F && k < F.t ? F.orig_T : T;      // the horizon the dispatcher knows at this moment
   $("clk").textContent = pad2(k); $("clkT").textContent = "/ " + pad2(known);
+  $("hClk").textContent = `ход ${pad2(k)} / ${pad2(known)}`;
   $("clkT").style.color = F && k >= F.t && T !== F.orig_T ? COL.red : "";
   let moving = 0, held = 0;
   S.rows.forEach((R, r) => {
@@ -1035,7 +1093,7 @@ function buildCharts() {
     });
     ends.sort((a, b) => a.y - b.y);
     for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 10) ends[i].y = ends[i - 1].y + 10;
-    for (const e of ends) s += `<text class="lbl-r rs" data-r="${e.r}" x="${CH.w - CH.r + 4}" y="${e.y + 3}" fill="${rc(e.r)}">${rid(e.r)}</text>`;
+    if (S.R <= 12) for (const e of ends) s += `<text class="lbl-r rs" data-r="${e.r}" x="${CH.w - CH.r + 4}" y="${e.y + 3}" fill="${rc(e.r)}">${rid(e.r)}</text>`;
     $("c3").innerHTML = ax + s + cursorSvg();
   }
   for (const id of ["c1", "c2", "c3"]) {
@@ -1066,6 +1124,8 @@ function setPlaying(on) {
   playing = on && S.T > 0;
   if (playing && time >= S.T) time = 0;
   $("bPlay").classList.toggle("on", playing); $("bPause").classList.toggle("on", !playing);
+  $("hPlay").innerHTML = playing ? $("bPause").innerHTML : $("bPlay").innerHTML;
+  $("hPlay").classList.toggle("on", playing);
   lastTs = null;
 }
 function seek(t) { setPlaying(false); time = clamp(t, 0, S.T); }
@@ -1078,6 +1138,7 @@ function frame(ts) {
       }
       lastTs = ts;
     }
+    if (needStatic) { needStatic = false; computeFit(); buildStatic(); }
     draw(ts);
     updatePanels();
   }
@@ -1087,6 +1148,7 @@ function load(i) {
   S = SCENARIOS[i];
   if (!S.prepared) { prepare(S); S.prepared = true; }
   selected = null; hoverOrder = null; lastK = -1; time = 0; setPlaying(false);
+  view = { z: 1, dx: 0, dy: 0 };
   resize(); buildPanels();
 }
 
@@ -1102,7 +1164,10 @@ document.addEventListener("keydown", e => {
   if (e.key === " ") { e.preventDefault(); setPlaying(!playing); }
   if (e.key === "ArrowRight") seek(Math.floor(time + 1e-9) + 1);
   if (e.key === "ArrowLeft") seek(Math.ceil(time - 1e-9) - 1);
-  if (e.key === "Escape") { selected = null; lastK = -1; }
+  if (e.key === "Escape") { selected = null; lastK = -1; if (floorEl.classList.contains("max")) { floorEl.classList.remove("max"); fsIcon(); } }
+  if (e.key === "f" || e.key === "F" || e.key === "а" || e.key === "А") toggleFs();
+  if (e.key === "+" || e.key === "=") zoomAt(1.4, cw / 2, ch / 2);
+  if (e.key === "-") zoomAt(1 / 1.4, cw / 2, ch / 2);
 });
 function pick(ev) {
   const b = cv.getBoundingClientRect(), x = ev.clientX - b.left, y = ev.clientY - b.top;
@@ -1110,7 +1175,60 @@ function pick(ev) {
   for (const h of hits) { const d = Math.hypot(h.x - x, h.y - y); if (d < h.rad && d < bd) { bd = d; best = h.r; } }
   return best;
 }
-cv.addEventListener("click", ev => { const r = pick(ev); selected = r === null || r === selected ? null : r; lastK = -1; });
+cv.addEventListener("click", ev => {
+  if (panned) { panned = false; return; }
+  const r = pick(ev); selected = r === null || r === selected ? null : r; lastK = -1;
+});
+
+/* ------------------------------------------------------------------ zoom, pan, fullscreen */
+const floorEl = cv.parentElement;
+function zoomAt(f, x, y) {
+  if (!S) return;
+  const z = clamp(view.z * f, 1, 60); f = z / view.z;
+  if (f === 1) return;
+  view.dx = f * view.dx + (1 - f) * x; view.dy = f * view.dy + (1 - f) * y; view.z = z;
+  if (z === 1) view.dx = view.dy = 0;
+  needStatic = true;
+}
+function resetView() { view = { z: 1, dx: 0, dy: 0 }; needStatic = true; }
+let drag = null, panned = false;
+cv.addEventListener("wheel", ev => {
+  ev.preventDefault();
+  const b = cv.getBoundingClientRect();
+  zoomAt(Math.exp(-clamp(ev.deltaY, -120, 120) * 0.0022), ev.clientX - b.left, ev.clientY - b.top);
+}, { passive: false });
+cv.addEventListener("pointerdown", ev => { if (ev.button === 0) drag = { x: ev.clientX, y: ev.clientY, id: ev.pointerId, moved: false }; });
+cv.addEventListener("pointermove", ev => {
+  if (!drag || ev.pointerId !== drag.id) return;
+  const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+  if (!drag.moved && Math.hypot(dx, dy) < 5) return;
+  if (!drag.moved) { drag.moved = true; cv.setPointerCapture(ev.pointerId); floorEl.classList.add("dragging"); }
+  view.dx += dx; view.dy += dy; drag.x = ev.clientX; drag.y = ev.clientY; needStatic = true;
+});
+const endDrag = () => { if (drag && drag.moved) panned = true; drag = null; floorEl.classList.remove("dragging"); };
+cv.addEventListener("pointerup", endDrag);
+cv.addEventListener("pointercancel", endDrag);
+cv.addEventListener("dblclick", resetView);
+$("zIn").addEventListener("click", () => zoomAt(1.5, cw / 2, ch / 2));
+$("zOut").addEventListener("click", () => zoomAt(1 / 1.5, cw / 2, ch / 2));
+$("zReset").addEventListener("click", resetView);
+const isFs = () => document.fullscreenElement === floorEl || floorEl.classList.contains("max");
+function fsIcon() {
+  $("fsIco").innerHTML = isFs() ? '<path d="M5 1v4H1M13 5H9V1M9 13V9h4M1 9h4v4" fill="none" stroke="currentColor" stroke-width="1.8"/>'
+                                : '<path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9" fill="none" stroke="currentColor" stroke-width="1.8"/>';
+  $("fs").setAttribute("aria-label", isFs() ? "Выйти из полноэкранного режима" : "Карта на весь экран");
+  $("fs").title = isFs() ? "Выйти из полноэкранного режима (F / Esc)" : "На весь экран (F)";
+}
+function toggleFs() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else if (floorEl.classList.contains("max")) floorEl.classList.remove("max");
+  else if (floorEl.requestFullscreen) floorEl.requestFullscreen().catch(() => floorEl.classList.add("max"));
+  else floorEl.classList.add("max");
+  fsIcon();
+}
+document.addEventListener("fullscreenchange", fsIcon);
+$("fs").addEventListener("click", toggleFs);
+$("hPlay").addEventListener("click", () => setPlaying(!playing));
 cv.addEventListener("mousemove", ev => { cv.style.cursor = pick(ev) === null ? "default" : "pointer"; });
 new ResizeObserver(() => { if (S) resize(); }).observe(cv.parentElement);
 if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { if (S) buildStatic(); });

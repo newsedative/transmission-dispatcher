@@ -39,7 +39,7 @@ TEMPLATE = Path(__file__).with_name("viz_ops_template.html")
 
 def grid_coords(n: int, m: int) -> List[List[float]]:
     """Координаты вершин сетки из generator.py: вершина i*m + j стоит в столбце j, строке i."""
-    return [[(v % m) / max(1, m - 1), (v // m) / max(1, n - 1)] for v in range(n * m)]
+    return [[round((v % m) / max(1, m - 1), 5), round((v // m) / max(1, n - 1), 5)] for v in range(n * m)]
 
 
 def auto_coords(num_vertices: int, edges: Sequence[Tuple[int, int]]) -> List[List[float]]:
@@ -292,18 +292,33 @@ def passport_failure(forced=(1, 2)) -> dict:
                             f"Малый эталон · отказ R-{forced[0]:02d} на такте {forced[1]}", coords=coords)
 
 
+def _try(build, *args, **kwargs) -> List[dict]:
+    """Собирает сценарий(и); если решатель не справился, пишет предупреждение и пропускает."""
+    try:
+        out = build(*args, **kwargs)
+    except (AssertionError, RuntimeError) as e:
+        print(f"пропущен {build.__name__}{args}: {e}")
+        return []
+    return out if isinstance(out, list) else [out]
+
+
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "dispatch.html"
     P_FAIL = 0.06       # вероятность отказа едущего робота за такт (настраивается)
     scs = [
-        passport_reference(),
-        passport_failure(forced=(1, 2)),
-        *generated_warehouse(6, 7, num_tasks=4, num_robots=4, battery=16, max_horizon=18, seed=3,
-                             failures=[{"p_fail": P_FAIL, "seed": 4, "guarantee": True},
-                                       {"forced": "busy"}]),
-        *generated_warehouse(7, 8, num_tasks=5, num_robots=4, battery=20, max_horizon=20, seed=5,
-                             failures=[{"p_fail": P_FAIL, "seed": 2, "guarantee": True}])[1:],
-        *generated_warehouse(10, 12, num_tasks=6, num_robots=5, battery=60, max_horizon=30, seed=3),
+        *_try(passport_reference),
+        *_try(passport_failure, forced=(1, 2)),
+        *_try(generated_warehouse, 6, 7, num_tasks=4, num_robots=4, battery=16, max_horizon=18, seed=3,
+              failures=[{"p_fail": P_FAIL, "seed": 4, "guarantee": True}, {"forced": "busy"}]),
+        *_try(generated_warehouse, 7, 8, num_tasks=5, num_robots=4, battery=20, max_horizon=20, seed=5,
+              failures=[{"p_fail": P_FAIL, "seed": 2, "guarantee": True}])[1:],
+        *_try(generated_warehouse, 10, 12, num_tasks=6, num_robots=5, battery=60, max_horizon=30, seed=3),
+        # большой склад под optimal-solver: роботы по правилу prepare_data (floor(0.2*sqrt(V)) = 12)
+        *_try(generated_warehouse, 64, 64, num_tasks=32, padding=3, battery=2000, max_horizon=(64 + 64) * 4,
+              seed=42, name="Большой склад: сетка 64×64, 12 роб., 32 задачи",
+              failures=[{"p_fail": 0.01, "seed": 3, "guarantee": True}]),
+        _try(generated_warehouse, 128, 128, num_tasks=64, padding=3, battery=5000, max_horizon=(128 + 128) * 4,
+             seed=42),
     ]
     for s in scs:
         f = s.get("failure")

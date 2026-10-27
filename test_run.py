@@ -3,7 +3,8 @@ test_run.py
 
 Двухуровневый решатель диспетчеризации роботов на графе (MAPD с передачей грузов):
 1. Верхний уровень (CP-SAT): пространственно-фильтрованная модель (Spatial Pruning)
-   с расчетом POI-дистанций, быстрым Warm-Start (AddHint) и минимизацией makespan.
+   с расчетом POI-дистанций, сбалансированным Warm-Start (Min-Load Round-Robin)
+   и точной минимизацией makespan.
 2. Нижний уровень (CBS + Space-Time A*): потактовое хронологическое планирование
    с точной эвристикой, синхронизацией эстафет и контролем вместимости (<= 2).
 
@@ -250,24 +251,74 @@ class GraphHandoffCpSatSolver:
         K = len(tasks)
         INF = self.oracle.INF
 
-        # 1. Предварительный прогрев кэша дистанций только для POI
+        # 1. Прогрев кэша дистанций для POI
         for r in robots:
             self.oracle.get_all_from(r.start_vertex)
         for t in tasks:
             self.oracle.get_all_from(t.start_vertex)
             self.oracle.get_all_from(t.finish_vertex)
 
-        # 2. Пространственная фильтрация: привязка к задаче только топ-C ближайших роботов
+        # 2. Сбалансированный жадный Warm-Start (Min-Load Round-Robin)
+        greedy_assigned: Dict[int, int] = {}
+        cur_pos = [robots[r].start_vertex for r in range(R)]
+        avail_t = [0] * R
+        task_count = [0] * R
+        max_tasks_per_robot = math.ceil(K / R) + 1
+
+        # Сортируем задачи: сначала самые длинные (их важно распределить первыми)
+        sorted_k = sorted(
+            range(K),
+            key=lambda k: self.oracle.dist(tasks[k].start_vertex, tasks[k].finish_vertex),
+            reverse=True,
+        )
+
+        for k in sorted_k:
+            task = tasks[k]
+            A, B = task.start_vertex, task.finish_vertex
+            d_AB = self.oracle.dist(A, B)
+            if d_AB >= INF:
+                continue
+
+            best_r = None
+            best_score = INF
+
+            for r in range(R):
+                d_pick = self.oracle.dist(cur_pos[r], A)
+                if d_pick >= INF:
+                    continue
+                t_fin = avail_t[r] + d_pick + d_AB
+                # Приоритет роботам с наименьшей занятостью
+                penalty = 300 if task_count[r] >= max_tasks_per_robot else 0
+                score = t_fin + penalty + avail_t[r] * 0.4
+
+                if score < best_score:
+                    best_score = score
+                    best_r = r
+
+            if best_r is not None:
+                greedy_assigned[k] = best_r
+                d_pick = self.oracle.dist(cur_pos[best_r], A)
+                avail_t[best_r] = avail_t[best_r] + d_pick + d_AB
+                cur_pos[best_r] = B
+                task_count[best_r] += 1
+            else:
+                greedy_assigned[k] = 0
+
+        # 3. Load-Aware Spatial Pruning: кандидат из warm-start + ближайшие
         cand_robots: Dict[int, List[int]] = {}
-        c_limit = min(R, max(4, int(math.ceil(R * 0.25))))
+        c_limit = min(R, max(5, int(math.ceil(R * 0.25))))
         for k, task in enumerate(tasks):
+            assigned_r = greedy_assigned.get(k, 0)
             ranked = sorted(
                 range(R),
-                key=lambda r: self.oracle.dist(robots[r].start_vertex, task.start_vertex),
+                key=lambda r: (
+                    0 if r == assigned_r else 1,
+                    self.oracle.dist(robots[r].start_vertex, task.start_vertex),
+                ),
             )
             cand_robots[k] = ranked[:c_limit]
 
-        # 3. Кандидаты в узлы эстафеты (handoff)
+        # 4. Кандидаты в узлы эстафеты (handoff)
         candidates: Dict[int, List[int]] = {}
         for k, task in enumerate(tasks):
             A, B = task.start_vertex, task.finish_vertex
@@ -277,7 +328,6 @@ class GraphHandoffCpSatSolver:
                 d_A = self.oracle.get_all_from(A)
                 d_B = self.oracle.get_all_from(B)
                 mid_target = d_AB // 2
-                # Ищем точки на кратчайшем пути близко к середине
                 for v in range(self.num_vertices):
                     if v != A and v != B and blocked.get(v, 0) == 0:
                         d1 = d_A[v]
@@ -290,7 +340,7 @@ class GraphHandoffCpSatSolver:
             else:
                 candidates[k] = []
 
-        # 4. Переменные модели
+        # 5. Переменные модели
         delivered = [model.NewBoolVar(f"deliv_{k}") for k in range(K)]
         direct = {
             (k, r): model.NewBoolVar(f"dir_{k}_{r}")
@@ -355,7 +405,7 @@ class GraphHandoffCpSatSolver:
                     for h in candidates[k]:
                         model.Add(t_start[k] >= d_init).OnlyEnforceIf(leg1[k, r, h])
 
-        # 5. Дизъюнкции: только для задач, где робот r является кандидатом
+        # 6. Дизъюнкции переходов между задачами
         tasks_for_robot: Dict[int, List[int]] = {r: [] for r in range(R)}
         for k in range(K):
             for r in cand_robots[k]:
@@ -398,7 +448,7 @@ class GraphHandoffCpSatSolver:
                     model.Add(t_start[k] >= t_end[j] + d_jk).OnlyEnforceIf([both, j_before_k])
                     model.Add(t_start[j] >= t_end[k] + d_kj).OnlyEnforceIf([both, j_before_k.Not()])
 
-        # 6. Ограничения батареи
+        # 7. Батарея
         for r, r_spec in enumerate(robots):
             energy_terms = []
             for k in tasks_for_robot[r]:
@@ -421,41 +471,36 @@ class GraphHandoffCpSatSolver:
         num_delivered = sum(delivered)
         model.Minimize((K - num_delivered) * 1_000_000 + makespan * 1000 + sum(t_dur))
 
-        # 7. Warm-Start: жадное первичное решение (AddHint)
-        pos = {r: robots[r].start_vertex for r in range(R)}
-        avail_t = {r: 0 for r in range(R)}
+        # 8. Непротиворечивые хинты (AddHint) цепочек по роботам
+        robot_tasks_order: Dict[int, List[int]] = {r: [] for r in range(R)}
+        for k in range(K):
+            if k in greedy_assigned:
+                robot_tasks_order[greedy_assigned[k]].append(k)
+
         greedy_ms = 0
-
-        for k, task in enumerate(tasks):
-            A, B = task.start_vertex, task.finish_vertex
-            d_AB = self.oracle.dist(A, B)
-            if d_AB >= INF:
-                continue
-
-            best_r = None
-            best_fin = INF
-            for r in cand_robots[k]:
-                d_to_pick = self.oracle.dist(pos[r], A)
-                t_fin = max(avail_t[r], 0) + d_to_pick + d_AB
-                if t_fin < best_fin:
-                    best_fin = t_fin
-                    best_r = r
-
-            if best_r is not None:
-                d_to_pick = self.oracle.dist(pos[best_r], A)
-                t_arr = avail_t[best_r] + d_to_pick
+        for r in range(R):
+            t_now = 0
+            p_now = robots[r].start_vertex
+            for k in robot_tasks_order[r]:
+                task = tasks[k]
+                A, B = task.start_vertex, task.finish_vertex
+                d_pick = self.oracle.dist(p_now, A)
+                d_AB = self.oracle.dist(A, B)
+                t_arr = t_now + d_pick
                 t_fin = t_arr + d_AB
+
                 model.AddHint(delivered[k], 1)
-                model.AddHint(direct[k, best_r], 1)
+                model.AddHint(direct[k, r], 1)
                 model.AddHint(t_start[k], t_arr)
                 model.AddHint(t_end[k], t_fin)
-                pos[best_r] = B
-                avail_t[best_r] = t_fin
-                greedy_ms = max(greedy_ms, t_fin)
+
+                t_now = t_fin
+                p_now = B
+            greedy_ms = max(greedy_ms, t_now)
 
         model.AddHint(makespan, min(max_horizon, greedy_ms))
 
-        # 8. Решение
+        # 9. Решение
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_s
         status = solver.Solve(model)
@@ -910,7 +955,6 @@ if __name__ == "__main__":
         max_robots_per_vertex=2,
     )
 
-    # Для больших сеток max_horizon должен покрывать максимальный диаметр и задачи
     horizon = max(num_tasks * n * 2, (n + m) * 4)
 
     res = solver.solve(

@@ -2,11 +2,12 @@
 test_run.py
 
 Двухуровневый решатель диспетчеризации роботов на графе (MAPD с передачей грузов):
-1. Верхний уровень (CP-SAT): балансировка нагрузки (VRP/дизъюнктивное расписание),
-   выбор эстафет (handoff), расчет холостых переходов и минимизация реального makespan.
-2. Нижний уровень (CBS + Space-Time A*): синхронизированное потактовое планирование
-   траекторий в хронологическом порядке, контроль вместимости вершин (<= 2) и батареи.
+1. Верхний уровень (CP-SAT): пространственно-фильтрованная модель (Spatial Pruning)
+   с расчетом POI-дистанций, быстрым Warm-Start (AddHint) и минимизацией makespan.
+2. Нижний уровень (CBS + Space-Time A*): потактовое хронологическое планирование
+   с точной эвристикой, синхронизацией эстафет и контролем вместимости (<= 2).
 
+Оптимизирован для сеток 128x128 и более (V > 16 000).
 Полностью совместим с failure.py и visualize.py.
 """
 
@@ -41,33 +42,49 @@ class TaskSpec:
 class ScheduleResult:
     success: bool
     makespan: int
-    # Потактовый план: timestep t -> список (robot_id, next_vertex, carried_task_id, battery_left)
     ticks: Dict[int, List[Tuple[int, int, Optional[int], int]]]
     handoff_events: List[str]
     solver_status: str
 
 
-def compute_all_pairs_distances(
-    num_vertices: int, adj: Dict[int, List[int]]
-) -> List[List[int]]:
-    """BFS для вычисления матрицы кратчайших расстояний между всеми вершинами."""
-    INF = 10**9
-    dist = [[INF] * num_vertices for _ in range(num_vertices)]
-    for s in range(num_vertices):
-        dist[s][s] = 0
-        q = deque([s])
-        while q:
-            u = q.popleft()
-            d = dist[s][u]
-            for v in adj[u]:
-                if v != u and dist[s][v] == INF:
-                    dist[s][v] = d + 1
-                    q.append(v)
-    return dist
+class DistanceOracle:
+    """
+    Ленивый кэш кратчайших расстояний.
+    Запускает BFS только из запрошенных точек интереса (POI: старты, финиши задач, базы роботов),
+    исключая дорогой All-Pairs BFS на O(V^2).
+    """
+
+    def __init__(self, num_vertices: int, adj: Dict[int, List[int]]) -> None:
+        self.num_vertices = num_vertices
+        self.adj = adj
+        self.cache: Dict[int, List[int]] = {}
+        self.INF = 10**9
+
+    def get_all_from(self, source: int) -> List[int]:
+        if source not in self.cache:
+            d = [self.INF] * self.num_vertices
+            d[source] = 0
+            q = deque([source])
+            while q:
+                u = q.popleft()
+                du = d[u]
+                for v in self.adj[u]:
+                    if v != u and d[v] == self.INF:
+                        d[v] = du + 1
+                        q.append(v)
+            self.cache[source] = d
+        return self.cache[source]
+
+    def dist(self, u: int, v: int) -> int:
+        if u in self.cache:
+            return self.cache[u][v]
+        if v in self.cache:
+            return self.cache[v][u]
+        return self.get_all_from(u)[v]
 
 
 class SpaceTimeAStar:
-    """Низкоуровневый планировщик пути одного робота в пространстве-времени."""
+    """Низкоуровневый планировщик пути робота с точной BFS-эвристикой."""
 
     @staticmethod
     def plan(
@@ -79,14 +96,15 @@ class SpaceTimeAStar:
         min_goal_t: int,
         max_horizon: int,
         adj: Dict[int, List[int]],
-        dist_matrix: List[List[int]],
-        constraints: Set[Tuple[int, int, int]],  # (robot_id, v, t)
-        reservation: Dict[Tuple[int, int], int],  # (v, t) -> robot count
+        dist_oracle: DistanceOracle,
+        constraints: Set[Tuple[int, int, int]],
+        reservation: Dict[Tuple[int, int], int],
         max_capacity: int,
         blocked_vertices: Dict[int, int],
     ) -> Optional[List[Tuple[int, int]]]:
+        goal_dists = dist_oracle.get_all_from(goal_v)
         counter = 0
-        h0 = max(dist_matrix[start_v][goal_v], max(0, min_goal_t - start_t))
+        h0 = max(goal_dists[start_v], max(0, min_goal_t - start_t))
         pq = [(start_t + h0, start_t, counter, start_v, start_batt, [(start_v, start_batt)])]
         visited: Dict[Tuple[int, int], int] = {}
 
@@ -118,7 +136,7 @@ class SpaceTimeAStar:
                     continue
 
                 counter += 1
-                h = max(dist_matrix[v][goal_v], max(0, min_goal_t - next_t))
+                h = max(goal_dists[v], max(0, min_goal_t - next_t))
                 next_f = next_t + h
                 heapq.heappush(
                     pq,
@@ -153,15 +171,15 @@ class GraphHandoffCpSatSolver:
             if u not in self.adj[v]:
                 self.adj[v].append(u)
 
-        self.dist = compute_all_pairs_distances(self.num_vertices, self.adj)
+        self.oracle = DistanceOracle(self.num_vertices, self.adj)
 
     def solve(
         self,
         robots: List[RobotSpec],
         tasks: List[TaskSpec],
-        max_horizon: int = 40,
+        max_horizon: int = 60,
         allow_floor_drop: bool = False,
-        time_limit_s: float = 30.0,
+        time_limit_s: float = 60.0,
         blocked_vertices: Optional[Dict[int, int]] = None,
         allow_undelivered: bool = False,
     ) -> ScheduleResult:
@@ -180,15 +198,18 @@ class GraphHandoffCpSatSolver:
             )
 
         # ---------------------------------------------------------------------
-        # 1. Верхний уровень (CP-SAT): распределение, транзиты, makespan
+        # 1. Верхний уровень (CP-SAT): распределение задач и окон
         # ---------------------------------------------------------------------
+        elapsed = time.time() - start_time
+        cp_time_budget = max(5.0, (time_limit_s - elapsed) * 0.7)
+
         high_level_plan = self._solve_high_level(
             robots,
             tasks,
             max_horizon,
             blocked,
             allow_undelivered,
-            time_limit_s=min(12.0, time_limit_s * 0.5),
+            time_limit_s=cp_time_budget,
         )
 
         if not high_level_plan["success"]:
@@ -201,9 +222,9 @@ class GraphHandoffCpSatSolver:
             )
 
         # ---------------------------------------------------------------------
-        # 2. Нижний уровень (CBS + Space-Time A*): синхронизация в lock-step
+        # 2. Нижний уровень (CBS + Space-Time A*): потактовые траектории
         # ---------------------------------------------------------------------
-        remaining_time = max(1.0, time_limit_s - (time.time() - start_time))
+        remaining_time = max(2.0, time_limit_s - (time.time() - start_time))
         low_level_result = self._solve_low_level_cbs(
             robots,
             tasks,
@@ -224,35 +245,57 @@ class GraphHandoffCpSatSolver:
         allow_undelivered: bool,
         time_limit_s: float,
     ) -> dict:
-        """
-        Дизъюнктивная модель расписания:
-        - Связывает makespan со временем реального окончания задач каждым роботом
-        - Учитывает холостые переходы между задачами
-        """
         model = cp_model.CpModel()
         R = len(robots)
         K = len(tasks)
-        INF = 10**9
+        INF = self.oracle.INF
 
+        # 1. Предварительный прогрев кэша дистанций только для POI
+        for r in robots:
+            self.oracle.get_all_from(r.start_vertex)
+        for t in tasks:
+            self.oracle.get_all_from(t.start_vertex)
+            self.oracle.get_all_from(t.finish_vertex)
+
+        # 2. Пространственная фильтрация: привязка к задаче только топ-C ближайших роботов
+        cand_robots: Dict[int, List[int]] = {}
+        c_limit = min(R, max(4, int(math.ceil(R * 0.25))))
+        for k, task in enumerate(tasks):
+            ranked = sorted(
+                range(R),
+                key=lambda r: self.oracle.dist(robots[r].start_vertex, task.start_vertex),
+            )
+            cand_robots[k] = ranked[:c_limit]
+
+        # 3. Кандидаты в узлы эстафеты (handoff)
         candidates: Dict[int, List[int]] = {}
         for k, task in enumerate(tasks):
             A, B = task.start_vertex, task.finish_vertex
-            d_AB = self.dist[A][B]
+            d_AB = self.oracle.dist(A, B)
             cands = []
-            if d_AB < INF and d_AB > 2:
-                for v in self.vertices:
+            if d_AB < INF and d_AB > 4:
+                d_A = self.oracle.get_all_from(A)
+                d_B = self.oracle.get_all_from(B)
+                mid_target = d_AB // 2
+                # Ищем точки на кратчайшем пути близко к середине
+                for v in range(self.num_vertices):
                     if v != A and v != B and blocked.get(v, 0) == 0:
-                        detour = self.dist[A][v] + self.dist[v][B]
-                        if detour <= d_AB + 2:
-                            cands.append((detour, v))
+                        d1 = d_A[v]
+                        d2 = d_B[v]
+                        if d1 + d2 <= d_AB + 2:
+                            balance = abs(d1 - mid_target)
+                            cands.append((balance, v))
                 cands.sort()
-                candidates[k] = [v for _, v in cands[:8]]
+                candidates[k] = [v for _, v in cands[:4]]
             else:
                 candidates[k] = []
 
+        # 4. Переменные модели
         delivered = [model.NewBoolVar(f"deliv_{k}") for k in range(K)]
         direct = {
-            (k, r): model.NewBoolVar(f"dir_{k}_{r}") for k in range(K) for r in range(R)
+            (k, r): model.NewBoolVar(f"dir_{k}_{r}")
+            for k in range(K)
+            for r in cand_robots[k]
         }
         relay_h = {
             (k, h): model.NewBoolVar(f"rel_h_{k}_{h}")
@@ -262,17 +305,16 @@ class GraphHandoffCpSatSolver:
         leg1 = {
             (k, r, h): model.NewBoolVar(f"l1_{k}_{r}_{h}")
             for k in range(K)
-            for r in range(R)
+            for r in cand_robots[k]
             for h in candidates[k]
         }
         leg2 = {
             (k, r, h): model.NewBoolVar(f"l2_{k}_{r}_{h}")
             for k in range(K)
-            for r in range(R)
+            for r in cand_robots[k]
             for h in candidates[k]
         }
 
-        # Временные интервалы выполнения задач
         t_start = [model.NewIntVar(0, max_horizon, f"ts_{k}") for k in range(K)]
         t_dur = [model.NewIntVar(0, max_horizon, f"td_{k}") for k in range(K)]
         t_end = [model.NewIntVar(0, max_horizon, f"te_{k}") for k in range(K)]
@@ -282,7 +324,7 @@ class GraphHandoffCpSatSolver:
             if not allow_undelivered:
                 model.Add(delivered[k] == 1)
 
-            modes = [direct[k, r] for r in range(R)] + [
+            modes = [direct[k, r] for r in cand_robots[k]] + [
                 relay_h[k, h] for h in candidates[k]
             ]
             if modes:
@@ -291,46 +333,50 @@ class GraphHandoffCpSatSolver:
                 model.Add(delivered[k] == 0)
 
             for h in candidates[k]:
-                model.Add(sum(leg1[k, r, h] for r in range(R)) == relay_h[k, h])
-                model.Add(sum(leg2[k, r, h] for r in range(R)) == relay_h[k, h])
-                for r in range(R):
+                model.Add(sum(leg1[k, r, h] for r in cand_robots[k]) == relay_h[k, h])
+                model.Add(sum(leg2[k, r, h] for r in cand_robots[k]) == relay_h[k, h])
+                for r in cand_robots[k]:
                     model.Add(leg1[k, r, h] + leg2[k, r, h] <= relay_h[k, h])
 
             dur_terms = []
-            if self.dist[A][B] < INF:
-                dur_terms.append(sum(direct[k, r] for r in range(R)) * self.dist[A][B])
+            if self.oracle.dist(A, B) < INF:
+                dur_terms.append(sum(direct[k, r] for r in cand_robots[k]) * self.oracle.dist(A, B))
             for h in candidates[k]:
-                d_split = self.dist[A][h] + self.dist[h][B]
+                d_split = self.oracle.dist(A, h) + self.oracle.dist(h, B)
                 dur_terms.append(relay_h[k, h] * d_split)
 
             model.Add(t_dur[k] == sum(dur_terms))
             model.Add(t_end[k] == t_start[k] + t_dur[k])
 
-            # Время выезда со стартовой позиции робота к первой задаче
-            for r, r_spec in enumerate(robots):
-                if self.dist[r_spec.start_vertex][A] < INF:
-                    model.Add(
-                        t_start[k] >= self.dist[r_spec.start_vertex][A]
-                    ).OnlyEnforceIf(direct[k, r])
+            for r in cand_robots[k]:
+                d_init = self.oracle.dist(robots[r].start_vertex, A)
+                if d_init < INF:
+                    model.Add(t_start[k] >= d_init).OnlyEnforceIf(direct[k, r])
                     for h in candidates[k]:
-                        model.Add(
-                            t_start[k] >= self.dist[r_spec.start_vertex][A]
-                        ).OnlyEnforceIf(leg1[k, r, h])
+                        model.Add(t_start[k] >= d_init).OnlyEnforceIf(leg1[k, r, h])
 
-        # Дизъюнкции: последовательность задач на каждом роботе с учётом перехода
+        # 5. Дизъюнкции: только для задач, где робот r является кандидатом
+        tasks_for_robot: Dict[int, List[int]] = {r: [] for r in range(R)}
+        for k in range(K):
+            for r in cand_robots[k]:
+                tasks_for_robot[r].append(k)
+
         for r in range(R):
-            for j in range(K):
-                for k in range(j + 1, K):
+            assigned_k = tasks_for_robot[r]
+            for idx_j in range(len(assigned_k)):
+                j = assigned_k[idx_j]
+                for idx_k in range(idx_j + 1, len(assigned_k)):
+                    k = assigned_k[idx_k]
+
                     task_j = tasks[j]
                     task_k = tasks[k]
 
-                    # Участвует ли робот r в задаче j и задаче k?
-                    in_j = [direct[j, r]] + [leg1[j, r, h] for h in candidates[j]] + [
-                        leg2[j, r, h] for h in candidates[j]
-                    ]
-                    in_k = [direct[k, r]] + [leg1[k, r, h] for h in candidates[k]] + [
-                        leg2[k, r, h] for h in candidates[k]
-                    ]
+                    in_j = [direct[j, r]] + [
+                        leg1[j, r, h] for h in candidates[j] if (j, r, h) in leg1
+                    ] + [leg2[j, r, h] for h in candidates[j] if (j, r, h) in leg2]
+                    in_k = [direct[k, r]] + [
+                        leg1[k, r, h] for h in candidates[k] if (k, r, h) in leg1
+                    ] + [leg2[k, r, h] for h in candidates[k] if (k, r, h) in leg2]
 
                     r_in_j = model.NewBoolVar(f"r{r}_in_{j}")
                     r_in_k = model.NewBoolVar(f"r{r}_in_{k}")
@@ -342,48 +388,74 @@ class GraphHandoffCpSatSolver:
                     model.AddBoolOr([r_in_j.Not(), r_in_k.Not()]).OnlyEnforceIf(both.Not())
 
                     j_before_k = model.NewBoolVar(f"ord_r{r}_{j}_{k}")
-
-                    # Оценка дистанции переезда от сдачи j до забора k
-                    d_jk = self.dist[task_j.finish_vertex][task_k.start_vertex]
-                    d_kj = self.dist[task_k.finish_vertex][task_j.start_vertex]
+                    d_jk = self.oracle.dist(task_j.finish_vertex, task_k.start_vertex)
+                    d_kj = self.oracle.dist(task_k.finish_vertex, task_j.start_vertex)
                     if d_jk >= INF:
                         d_jk = 0
                     if d_kj >= INF:
                         d_kj = 0
 
-                    model.Add(t_start[k] >= t_end[j] + d_jk).OnlyEnforceIf(
-                        [both, j_before_k]
-                    )
-                    model.Add(t_start[j] >= t_end[k] + d_kj).OnlyEnforceIf(
-                        [both, j_before_k.Not()]
-                    )
+                    model.Add(t_start[k] >= t_end[j] + d_jk).OnlyEnforceIf([both, j_before_k])
+                    model.Add(t_start[j] >= t_end[k] + d_kj).OnlyEnforceIf([both, j_before_k.Not()])
 
-        # Ограничения батареи
+        # 6. Ограничения батареи
         for r, r_spec in enumerate(robots):
             energy_terms = []
-            for k, task in enumerate(tasks):
+            for k in tasks_for_robot[r]:
+                task = tasks[k]
                 A, B = task.start_vertex, task.finish_vertex
-                if self.dist[A][B] < INF:
-                    energy_terms.append(direct[k, r] * self.dist[A][B])
+                if self.oracle.dist(A, B) < INF:
+                    energy_terms.append(direct[k, r] * self.oracle.dist(A, B))
                 for h in candidates[k]:
-                    if self.dist[A][h] < INF:
-                        energy_terms.append(leg1[k, r, h] * self.dist[A][h])
-                    if self.dist[h][B] < INF:
-                        energy_terms.append(leg2[k, r, h] * self.dist[h][B])
+                    if (k, r, h) in leg1 and self.oracle.dist(A, h) < INF:
+                        energy_terms.append(leg1[k, r, h] * self.oracle.dist(A, h))
+                    if (k, r, h) in leg2 and self.oracle.dist(h, B) < INF:
+                        energy_terms.append(leg2[k, r, h] * self.oracle.dist(h, B))
 
             model.Add(sum(energy_terms) <= r_spec.battery)
 
-        # РЕАЛЬНЫЙ makespan: верхняя граница окончания всех доставленных задач
         makespan = model.NewIntVar(0, max_horizon, "makespan")
         for k in range(K):
             model.Add(makespan >= t_end[k]).OnlyEnforceIf(delivered[k])
 
         num_delivered = sum(delivered)
-        # Приоритет: 1) Максимум доставленных, 2) Минимум makespan (балансировка!), 3) Экономия пути
-        model.Minimize(
-            (K - num_delivered) * 1_000_000 + makespan * 1000 + sum(t_dur)
-        )
+        model.Minimize((K - num_delivered) * 1_000_000 + makespan * 1000 + sum(t_dur))
 
+        # 7. Warm-Start: жадное первичное решение (AddHint)
+        pos = {r: robots[r].start_vertex for r in range(R)}
+        avail_t = {r: 0 for r in range(R)}
+        greedy_ms = 0
+
+        for k, task in enumerate(tasks):
+            A, B = task.start_vertex, task.finish_vertex
+            d_AB = self.oracle.dist(A, B)
+            if d_AB >= INF:
+                continue
+
+            best_r = None
+            best_fin = INF
+            for r in cand_robots[k]:
+                d_to_pick = self.oracle.dist(pos[r], A)
+                t_fin = max(avail_t[r], 0) + d_to_pick + d_AB
+                if t_fin < best_fin:
+                    best_fin = t_fin
+                    best_r = r
+
+            if best_r is not None:
+                d_to_pick = self.oracle.dist(pos[best_r], A)
+                t_arr = avail_t[best_r] + d_to_pick
+                t_fin = t_arr + d_AB
+                model.AddHint(delivered[k], 1)
+                model.AddHint(direct[k, best_r], 1)
+                model.AddHint(t_start[k], t_arr)
+                model.AddHint(t_end[k], t_fin)
+                pos[best_r] = B
+                avail_t[best_r] = t_fin
+                greedy_ms = max(greedy_ms, t_fin)
+
+        model.AddHint(makespan, min(max_horizon, greedy_ms))
+
+        # 8. Решение
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_s
         status = solver.Solve(model)
@@ -398,7 +470,7 @@ class GraphHandoffCpSatSolver:
                 end_t_val = solver.Value(t_end[k])
 
                 is_dir = False
-                for r in range(R):
+                for r in cand_robots[k]:
                     if solver.BooleanValue(direct[k, r]):
                         plan_tasks.append(
                             {
@@ -422,15 +494,15 @@ class GraphHandoffCpSatSolver:
                         if solver.BooleanValue(relay_h[k, h]):
                             r1 = next(
                                 r
-                                for r in range(R)
+                                for r in cand_robots[k]
                                 if solver.BooleanValue(leg1[k, r, h])
                             )
                             r2 = next(
                                 r
-                                for r in range(R)
+                                for r in cand_robots[k]
                                 if solver.BooleanValue(leg2[k, r, h])
                             )
-                            t_mid = start_t_val + self.dist[task.start_vertex][h]
+                            t_mid = start_t_val + self.oracle.dist(task.start_vertex, h)
                             plan_tasks.append(
                                 {
                                     "task_id": task.task_id,
@@ -467,7 +539,6 @@ class GraphHandoffCpSatSolver:
         R = len(robots)
         scheduled_tasks = high_level["tasks"]
 
-        # Формируем этапы
         all_legs = []
         for item in scheduled_tasks:
             if not item["relay"]:
@@ -509,7 +580,6 @@ class GraphHandoffCpSatSolver:
                     }
                 )
 
-        # Сортируем этапы строго по времени начала (хронологический порядок)
         all_legs.sort(key=lambda leg: leg["t_est_start"])
 
         constraints: Set[Tuple[int, int, int]] = set()
@@ -556,7 +626,6 @@ class GraphHandoffCpSatSolver:
         max_horizon: int,
         blocked: Dict[int, int],
     ) -> Optional[Tuple[Dict[int, List[int]], Dict[int, List[Optional[int]]]]]:
-        """Синхронное пошаговое выполнение этапов с rendezvous в точках эстафеты."""
         R = len(robots)
         paths: Dict[int, List[int]] = {r: [robots[r].start_vertex] for r in range(R)}
         batt: Dict[int, List[int]] = {r: [robots[r].battery] for r in range(R)}
@@ -577,7 +646,6 @@ class GraphHandoffCpSatSolver:
                 key = (leg["task_id"], leg["pickup"])
                 t_partner_arr = handoff_events_arrival.get(key, 0)
 
-                # Путь до точки встречи
                 p_to_meet = SpaceTimeAStar.plan(
                     r,
                     curr_v,
@@ -587,7 +655,7 @@ class GraphHandoffCpSatSolver:
                     t_partner_arr,
                     max_horizon,
                     self.adj,
-                    self.dist,
+                    self.oracle,
                     constraints,
                     reservation,
                     self.max_robots_per_vertex,
@@ -600,13 +668,11 @@ class GraphHandoffCpSatSolver:
                 curr_v = paths[r][-1]
                 curr_b = batt[r][-1]
 
-                # Синхронизация встречи: если приехал раньше напарника, ждёт в точке
                 t_meet = max(curr_t, t_partner_arr)
                 while curr_t < t_meet:
                     self._append_wait(r, paths, batt, task_held, reservation)
                     curr_t += 1
 
-                # Доставка груза до финиша
                 p_deliv = SpaceTimeAStar.plan(
                     r,
                     curr_v,
@@ -616,7 +682,7 @@ class GraphHandoffCpSatSolver:
                     curr_t + 1,
                     max_horizon,
                     self.adj,
-                    self.dist,
+                    self.oracle,
                     constraints,
                     reservation,
                     self.max_robots_per_vertex,
@@ -629,7 +695,6 @@ class GraphHandoffCpSatSolver:
                 )
 
             else:
-                # Прямая доставка или первый этап эстафеты (handoff_drop)
                 if curr_v != leg["pickup"]:
                     p_to_pick = SpaceTimeAStar.plan(
                         r,
@@ -640,7 +705,7 @@ class GraphHandoffCpSatSolver:
                         curr_t,
                         max_horizon,
                         self.adj,
-                        self.dist,
+                        self.oracle,
                         constraints,
                         reservation,
                         self.max_robots_per_vertex,
@@ -664,7 +729,7 @@ class GraphHandoffCpSatSolver:
                     curr_t + 1,
                     max_horizon,
                     self.adj,
-                    self.dist,
+                    self.oracle,
                     constraints,
                     reservation,
                     self.max_robots_per_vertex,
@@ -681,7 +746,6 @@ class GraphHandoffCpSatSolver:
                         len(paths[r]) - 1
                     )
 
-        # Выравниваем по длине все траектории до единого глобального makespan
         max_T = max(len(paths[r]) for r in range(R))
         for r in range(R):
             while len(paths[r]) < max_T:
@@ -846,10 +910,13 @@ if __name__ == "__main__":
         max_robots_per_vertex=2,
     )
 
+    # Для больших сеток max_horizon должен покрывать максимальный диаметр и задачи
+    horizon = max(num_tasks * n * 2, (n + m) * 4)
+
     res = solver.solve(
         robots=robots,
         tasks=tasks,
-        max_horizon=num_tasks * n * 2,
+        max_horizon=horizon,
         time_limit_s=60,
     )
     print_output(res)

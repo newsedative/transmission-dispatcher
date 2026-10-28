@@ -314,10 +314,10 @@ if __name__ == "__main__":
               failures=[{"p_fail": P_FAIL, "seed": 2, "guarantee": True}])[1:],
         *_try(generated_warehouse, 10, 12, num_tasks=6, num_robots=5, battery=60, max_horizon=30, seed=3),
         # большой склад под optimal-solver: роботы по правилу prepare_data (floor(0.2*sqrt(V)) = 12)
-        *_try(generated_warehouse, 64, 64, num_tasks=32, padding=3, battery=2000, max_horizon=(64 + 64) * 4,
+        *_try(generated_warehouse, 64, 64, num_tasks=32,num_robots=6, padding=3, battery=2000, max_horizon=(64 + 64) * 4,
               seed=42, name="Большой склад: сетка 64×64, 12 роб., 32 задачи",
               failures=[{"p_fail": 0.01, "seed": 3, "guarantee": True}]),
-        _try(generated_warehouse, 128, 128, num_tasks=64, padding=3, battery=5000, max_horizon=(128 + 128) * 4,
+        *_try(generated_warehouse, 128, 128, num_tasks=64, num_robots=13, padding=3, battery=5000, max_horizon=(128 + 128) * 4,
              seed=42),
     ]
     for s in scs:

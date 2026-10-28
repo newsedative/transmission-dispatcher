@@ -161,10 +161,12 @@ class GraphHandoffCpSatSolver:
         num_vertices: int,
         edges: List[Tuple[int, int]],
         max_robots_per_vertex: int = 2,
+        tau: int = 0
     ) -> None:
         self.vertices = list(range(num_vertices))
         self.num_vertices = num_vertices
         self.max_robots_per_vertex = max_robots_per_vertex
+        self.tau = tau
 
         self.adj: Dict[int, List[int]] = {v: [v] for v in self.vertices}
         for u, v in edges:
@@ -392,7 +394,7 @@ class GraphHandoffCpSatSolver:
             if self.oracle.dist(A, B) < INF:
                 dur_terms.append(sum(direct[k, r] for r in cand_robots[k]) * self.oracle.dist(A, B))
             for h in candidates[k]:
-                d_split = self.oracle.dist(A, h) + self.oracle.dist(h, B)
+                d_split = self.oracle.dist(A, h) + self.tau + self.oracle.dist(h, B)
                 dur_terms.append(relay_h[k, h] * d_split)
 
             model.Add(t_dur[k] == sum(dur_terms))
@@ -623,7 +625,7 @@ class GraphHandoffCpSatSolver:
                         "dropoff": item["finish"],
                         "type": "handoff_pickup",
                         "partner": item["r1"],
-                        "t_est_start": item["t_mid"],
+                        "t_est_start": item["t_mid"] + self.tau,
                         "t_est_end": item["t_end"],
                     }
                 )
@@ -726,6 +728,11 @@ class GraphHandoffCpSatSolver:
                 while partner_cur_t < t_meet:
                     self._append_wait(partner_r, paths, batt, task_held, leg["task_id"])
                     partner_cur_t += 1
+
+                for _ in range(self.tau):
+                    self._append_wait(r, paths, batt, task_held, None)
+                    self._append_wait(partner_r, paths, batt, task_held, leg["task_id"])
+                    curr_t += 1
 
                 # Доставка груза до финиша
                 p_deliv = SpaceTimeAStar.plan(

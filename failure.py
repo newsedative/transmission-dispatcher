@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import random
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from test_run import GraphHandoffCpSatSolver, RobotSpec, ScheduleResult, TaskSpec
@@ -37,10 +38,15 @@ class FailureEvent:
 @dataclass
 class FailureRun:
     original: ScheduleResult                  # план без отказа
-    failure: Optional[FailureEvent]
-    replan: Optional[ScheduleResult]          # план оставшихся роботов с момента отказа (такты с 1)
+    failure: Optional[FailureEvent]           # первый отказ (None — отказов не было)
+    replan: Optional[ScheduleResult]          # план оставшихся роботов с момента последнего отказа
     replan_tasks: List[TaskSpec]              # что перепланировали: старт = где груз лежал в момент отказа
     result: ScheduleResult                    # итоговый план, такты 1..makespan
+    # все отказы по порядку; plans[i] — план, который действовал до отказа failures[i]
+    # (plans[0] = original), replanned[i] — задачи, перепланированные после него
+    failures: List[FailureEvent] = field(default_factory=list)
+    plans: List[ScheduleResult] = field(default_factory=list)
+    replanned: List[List[TaskSpec]] = field(default_factory=list)
 
 
 def plan_state(robots: List[RobotSpec], tasks: List[TaskSpec], res: ScheduleResult, t: int):
@@ -74,16 +80,18 @@ def _failure_at(robots: List[RobotSpec], tasks: List[TaskSpec], res: ScheduleRes
 
 def sample_failure(robots: List[RobotSpec], tasks: List[TaskSpec], res: ScheduleResult, p_fail: float,
                    rng: random.Random, only_moving: bool = True,
-                   guarantee: bool = False) -> Optional[FailureEvent]:
+                   guarantee: bool = False, after: int = 0,
+                   exclude: Sequence[int] = ()) -> Optional[FailureEvent]:
     """Разыгрывает отказ по плану res: на такте t (1 <= t < T) каждый робот, который едет на шаге
     t -> t+1 (или любой, если only_moving=False), ломается с вероятностью p_fail.
 
     guarantee=True — отказ обязательно случается: розыгрыш повторяется, пока кто-нибудь не сломается
-    (то есть момент и робот берутся из того же распределения при условии, что отказ был)."""
+    (то есть момент и робот берутся из того же распределения при условии, что отказ был).
+    after — отказ только позже этого такта, exclude — id роботов, которые уже сломаны."""
     if not 0 <= p_fail <= 1:
         raise ValueError("p_fail должна быть от 0 до 1")
     for _ in range(10_000 if guarantee and p_fail > 0 else 1):
-        failure = _sample_once(robots, tasks, res, p_fail, rng, only_moving)
+        failure = _sample_once(robots, tasks, res, p_fail, rng, only_moving, after, exclude)
         if failure is not None:
             return failure
     return None
@@ -100,11 +108,11 @@ def busy_failure(robots: List[RobotSpec], tasks: List[TaskSpec], res: ScheduleRe
     return None
 
 
-def _sample_once(robots, tasks, res, p_fail, rng, only_moving):
-    for t in range(1, res.makespan):
+def _sample_once(robots, tasks, res, p_fail, rng, only_moving, after=0, exclude=()):
+    for t in range(after + 1, res.makespan):
         pos, _, _, carrier = plan_state(robots, tasks, res, t)
         nxt = {row[0]: row[1] for row in res.ticks[t + 1]}
-        ids = [r.robot_id for r in robots]
+        ids = [r.robot_id for r in robots if r.robot_id not in exclude]
         rng.shuffle(ids)
         for robot_id in ids:
             if only_moving and nxt[robot_id] == pos[robot_id]:
@@ -116,16 +124,21 @@ def _sample_once(robots, tasks, res, p_fail, rng, only_moving):
 
 def replan_after_failure(solver: GraphHandoffCpSatSolver, robots: List[RobotSpec], tasks: List[TaskSpec],
                          res: ScheduleResult, failure: FailureEvent, max_horizon: int,
-                         time_limit_s: float = 30.0) -> Tuple[ScheduleResult, List[TaskSpec], List[RobotSpec]]:
-    """Перестраивает план с момента отказа для исправных роботов и недоставленных грузов."""
+                         time_limit_s: float = 30.0, earlier: Sequence[FailureEvent] = ()
+                         ) -> Tuple[ScheduleResult, List[TaskSpec], List[RobotSpec]]:
+    """Перестраивает план с момента отказа для исправных роботов и недоставленных грузов.
+    earlier — отказы, случившиеся раньше: эти роботы тоже стоят и занимают места."""
+    broken = [*earlier, failure]
+    dead = {f.robot_id for f in broken}
     pos, battery, cargo, _ = plan_state(robots, tasks, res, failure.tick)
     alive = [RobotSpec(r.robot_id, pos[r.robot_id], battery[r.robot_id])
-             for r in robots if r.robot_id != failure.robot_id]
+             for r in robots if r.robot_id not in dead]
     left = [TaskSpec(task.task_id, cargo[task.task_id], task.finish_vertex)
             for task in tasks if cargo[task.task_id] != task.finish_vertex]
     if not left:
         return ScheduleResult(True, 0, {}, [], "OPTIMAL"), left, alive
-    kw = dict(max_horizon=max_horizon, time_limit_s=time_limit_s, blocked_vertices={failure.vertex: 1})
+    kw = dict(max_horizon=max_horizon, time_limit_s=time_limit_s,
+              blocked_vertices=dict(Counter(f.vertex for f in broken)))
     sub = solver.solve(alive, left, **kw)
     if not sub.success:
         # всё довезти нельзя (не хватает заряда или груз заперт) — довозим сколько получится
@@ -134,14 +147,15 @@ def replan_after_failure(solver: GraphHandoffCpSatSolver, robots: List[RobotSpec
 
 
 def merge_plans(robots: List[RobotSpec], res: ScheduleResult, failure: FailureEvent,
-                sub: ScheduleResult) -> ScheduleResult:
-    """Такты 1..t_f — исходный план, дальше — перестроенный; сломанный робот стоит на месте."""
+                sub: ScheduleResult, earlier: Sequence[FailureEvent] = ()) -> ScheduleResult:
+    """Такты 1..t_f — прежний план, дальше — перестроенный; сломанные роботы стоят на месте."""
     t_f = failure.tick
     ticks = {t: list(res.ticks[t]) for t in range(1, t_f + 1)}
-    frozen = next(row for row in res.ticks[t_f] if row[0] == failure.robot_id) if t_f else None
+    dead = {f.robot_id for f in [*earlier, failure]}
+    frozen = [(row[0], row[1], None, row[3]) for row in res.ticks[t_f] if row[0] in dead] if t_f else []
     order = {r.robot_id: i for i, r in enumerate(robots)}
     for t in range(1, sub.makespan + 1):
-        rows = list(sub.ticks[t]) + [(failure.robot_id, failure.vertex, None, frozen[3])]
+        rows = list(sub.ticks[t]) + frozen
         ticks[t_f + t] = sorted(rows, key=lambda row: order[row[0]])
     shift = lambda s: re.sub(r"^Такт (\d+)", lambda m: f"Такт {int(m.group(1)) + t_f}", s)
     events = [e for e in res.handoff_events if int(re.match(r"Такт (\d+)", e).group(1)) < t_f]
@@ -156,11 +170,14 @@ def run_with_failure(num_vertices: int, edges: Sequence[Tuple[int, int]], robots
                      tasks: List[TaskSpec], p_fail: float = 0.05, seed: int = 0, max_horizon: int = 30,
                      time_limit_s: float = 60.0, replan_time_limit_s: float = 30.0,
                      original: Optional[ScheduleResult] = None,
-                     forced: Optional[Tuple[int, int]] = None, guarantee: bool = False) -> FailureRun:
-    """Строит план, разыгрывает отказ и, если он случился, перестраивает план.
+                     forced=None, guarantee: bool = False, count: int = 1) -> FailureRun:
+    """Строит план, разыгрывает отказы и после каждого перестраивает план.
 
     original — уже найденный план без отказа (чтобы не решать заново);
-    forced = (robot_id, t) — отказ задан вручную вместо розыгрыша, forced="busy" — см. busy_failure;
+    count — сколько роботов сломается за прогон (каждый следующий — позже предыдущего, на уже
+    перестроенном плане; при guarantee=False отказов может оказаться меньше);
+    forced = (robot_id, t) или список таких пар — отказы заданы вручную вместо розыгрыша,
+    forced="busy" — см. busy_failure (один отказ);
     guarantee=True — розыгрыш, при котором отказ обязательно случается.
     """
     solver = GraphHandoffCpSatSolver(num_vertices, list(edges))
@@ -170,17 +187,34 @@ def run_with_failure(num_vertices: int, edges: Sequence[Tuple[int, int]], robots
         raise RuntimeError(f"исходный план не найден: {original.solver_status}")
     if forced == "busy":
         forced = busy_failure(robots, tasks, original)
+    if forced is not None and not isinstance(forced[0], (tuple, list)):
+        forced = [forced]
     if forced is not None:
-        failure = _failure_at(robots, tasks, original, *forced)
-    else:
-        failure = sample_failure(robots, tasks, original, p_fail, random.Random(seed), guarantee=guarantee)
-    if failure is None:
+        count = len(forced)
+    rng = random.Random(seed)
+    plan, failures, plans, replanned = original, [], [], []
+    sub, left = None, []
+    for i in range(count):
+        after = failures[-1].tick if failures else 0
+        dead = [f.robot_id for f in failures]
+        if forced is not None:
+            failure = _failure_at(robots, tasks, plan, *forced[i])
+        else:
+            failure = sample_failure(robots, tasks, plan, p_fail, rng, guarantee=guarantee,
+                                     after=after, exclude=dead)
+        if failure is None:
+            break
+        sub, left, _ = replan_after_failure(solver, robots, tasks, plan, failure, max_horizon=max_horizon,
+                                            time_limit_s=replan_time_limit_s, earlier=failures)
+        if not sub.success:
+            raise RuntimeError(f"перестроенный план не найден: {sub.solver_status}")
+        plans.append(plan)
+        replanned.append(left)
+        plan = merge_plans(robots, plan, failure, sub, earlier=failures)
+        failures.append(failure)
+    if not failures:
         return FailureRun(original, None, None, [], original)
-    sub, left, _ = replan_after_failure(solver, robots, tasks, original, failure,
-                                        max_horizon=max_horizon, time_limit_s=replan_time_limit_s)
-    if not sub.success:
-        raise RuntimeError(f"перестроенный план не найден: {sub.solver_status}")
-    return FailureRun(original, failure, sub, left, merge_plans(robots, original, failure, sub))
+    return FailureRun(original, failures[0], sub, left, plan, failures, plans, replanned)
 
 
 if __name__ == "__main__":

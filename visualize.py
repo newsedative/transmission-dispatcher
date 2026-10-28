@@ -197,8 +197,8 @@ def failure_scenario(num_vertices: int, edges, robots: List[RobotSpec], tasks: L
             sc["description"] = (f"{num_vertices} вершин, {len(robots)} роб., {len(tasks)} задач. "
                                  f"Отказ не выпал (p = {p_fail}), план выполнен за {sc['makespan']} тактов.")
         return sc
-    r_f = next(i for i, r in enumerate(robots) if r.robot_id == f.robot_id)
     k_of = {t.task_id: k for k, t in enumerate(tasks)}
+    r_of = {r.robot_id: i for i, r in enumerate(robots)}
     T0 = run.original.makespan
     opos, ohold = plan_from_ticks(robots, tasks, run.original)
     odone: List[Optional[int]] = [None] * len(tasks)
@@ -207,22 +207,33 @@ def failure_scenario(num_vertices: int, edges, robots: List[RobotSpec], tasks: L
             odone[e[2]] = e[0]
     final = cargo_track(tasks, sc["pos"], sc["hold"], sc["makespan"])
     undelivered = [k for k, task in enumerate(tasks) if final[k] != task.finish_vertex]
+    stages = []
+    for i, (fe, plan, left) in enumerate(zip(run.failures, run.plans, run.replanned)):
+        ppos, _ = plan_from_ticks(robots, tasks, plan)
+        stages.append({
+            "r": r_of[fe.robot_id], "t": fe.tick, "v": fe.vertex,
+            "task": None if fe.carried_task is None else k_of[fe.carried_task],
+            "prev_T": plan.makespan,          # длина плана, который действовал до этого отказа
+            "prev_pos": ppos,                 # и сам этот план (у первого отказа — исходный)
+            "replanned": [k_of[t.task_id] for t in left],
+            "alive": len(robots) - i - 1,
+        })
     sc["failure"] = {
-        "r": r_f, "t": f.tick, "v": f.vertex,
-        "task": None if f.carried_task is None else k_of[f.carried_task],
         "p": p_fail,
         "orig_T": T0, "orig_optimal": run.original.solver_status == "OPTIMAL",
-        "orig_pos": opos, "orig_done": odone,
-        "replanned": [k_of[t.task_id] for t in run.replan_tasks],
+        "orig_done": odone,
         "undelivered": undelivered,
-        "alive": len(robots) - 1,
+        "list": stages,
     }
     if not description:
-        rid = f"R-{f.robot_id:02d}"
-        cargo = f" с грузом #{f.carried_task} на борту" if f.carried_task is not None else ""
+        parts = []
+        for fe in run.failures:
+            cargo = f" с грузом #{fe.carried_task}" if fe.carried_task is not None else ""
+            parts.append(f"на такте {fe.tick} R-{fe.robot_id:02d} (вершина {fe.vertex}){cargo}")
+        n = len(run.failures)
         sc["description"] = (f"{num_vertices} вершин, {len(robots)} роб., {len(tasks)} задач. "
-                             f"На такте {f.tick} отказал {rid} (вершина {f.vertex}){cargo}; план перестроен "
-                             f"для {len(robots) - 1} роб.: {T0} → {sc['makespan']} тактов, доставлено "
+                             f"{'Отказ' if n == 1 else f'Отказы ({n})'}: {'; '.join(parts)}. План перестроен "
+                             f"для {len(robots) - n} роб.: {T0} → {sc['makespan']} тактов, доставлено "
                              f"{sc['delivered']} из {len(tasks)}.")
     return sc
 
@@ -260,7 +271,9 @@ def generated_warehouse(n: int, m: int, num_tasks: int, seed: int = 42, padding:
     num_robots=None — число роботов по правилу prepare_data, floor(0.2*sqrt(V)); иначе своё.
     failures — варианты отказа поверх того же плана, каждый как аргументы run_with_failure:
     {"p_fail": 0.06, "seed": 4} (розыгрыш; "guarantee": True — отказ обязательно случится),
-    {"forced": (robot_id, t)} или {"forced": "busy"} (ломается робот с грузом). Возвращает список
+    {"forced": (robot_id, t)} или {"forced": "busy"} (ломается робот с грузом);
+    "count": 2 — сколько роботов сломается за прогон (по очереди, с перестройкой после каждого),
+    {"forced": [(3, 10), (5, 40)]} — несколько отказов вручную. Возвращает список
     сценариев: сначала план без отказа, затем по одному на каждый вариант отказа.
     """
     graph = generate_graph(n=n, m=m, padding=padding, remove_prob=remove_prob, seed=seed)
@@ -274,8 +287,8 @@ def generated_warehouse(n: int, m: int, num_tasks: int, seed: int = 42, padding:
     out = [scenario(V, edges, robots, tasks, res, name, coords=grid_coords(n, m))]
     for fl in failures:
         run = run_with_failure(V, edges, robots, tasks, original=res, max_horizon=max_horizon, **fl)
-        tag = (f"отказ R-{run.failure.robot_id:02d} на такте {run.failure.tick}" if run.failure
-               else "отказ не выпал")
+        tag = (", ".join(f"отказ R-{f.robot_id:02d} на такте {f.tick}" for f in run.failures)
+               if run.failure else "отказ не выпал")
         out.append(failure_scenario(V, edges, robots, tasks, run, f"{name} · {tag}",
                                     coords=grid_coords(n, m), p_fail=fl.get("p_fail")))
     return out
@@ -306,24 +319,26 @@ if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "dispatch.html"
     P_FAIL = 0.06       # вероятность отказа едущего робота за такт (настраивается)
     scs = [
-        *_try(passport_reference),
-        *_try(passport_failure, forced=(1, 2)),
-        *_try(generated_warehouse, 6, 7, num_tasks=4, num_robots=4, battery=16, max_horizon=18, seed=3,
-              failures=[{"p_fail": P_FAIL, "seed": 4, "guarantee": True}, {"forced": "busy"}]),
-        *_try(generated_warehouse, 7, 8, num_tasks=5, num_robots=4, battery=20, max_horizon=20, seed=5,
-              failures=[{"p_fail": P_FAIL, "seed": 2, "guarantee": True}])[1:],
-        *_try(generated_warehouse, 10, 12, num_tasks=6, num_robots=5, battery=60, max_horizon=30, seed=3),
+        # *_try(passport_reference),
+        # *_try(passport_failure, forced=(1, 2)),
+        # *_try(generated_warehouse, 6, 7, num_tasks=4, num_robots=4, battery=16, max_horizon=18, seed=3,
+        #       failures=[{"p_fail": P_FAIL, "seed": 4, "guarantee": True}, {"forced": "busy"}]),
+        # *_try(generated_warehouse, 7, 8, num_tasks=5, num_robots=4, battery=20, max_horizon=20, seed=5,
+        #       failures=[{"p_fail": P_FAIL, "seed": 2, "guarantee": True}])[1:],
+        # *_try(generated_warehouse, 10, 12, num_tasks=6, num_robots=5, battery=60, max_horizon=30, seed=3),
         # большой склад под optimal-solver: роботы по правилу prepare_data (floor(0.2*sqrt(V)) = 12)
         *_try(generated_warehouse, 64, 64, num_tasks=32,num_robots=6, padding=3, battery=2000, max_horizon=(64 + 64) * 4,
               seed=42, name="Большой склад: сетка 64×64, 12 роб., 32 задачи",
-              failures=[{"p_fail": 0.01, "seed": 3, "guarantee": True}]),
-        *_try(generated_warehouse, 128, 128, num_tasks=64, num_robots=13, padding=3, battery=5000, max_horizon=(128 + 128) * 4,
-             seed=42),
+              failures=[{"p_fail": 0.0015, "seed": 3, "guarantee": True, "count": 2}]),
+        # 128×128, два отказа подряд ("count": 2), после каждого план перестраивается (сборка ~3 мин)
+        *_try(generated_warehouse, 128, 128, num_tasks=64, num_robots=13, padding=3, battery=5000,
+              max_horizon=(128 + 128) * 4, seed=42,
+              failures=[{"p_fail": 0.0015, "seed": 3, "guarantee": True, "count": 2}]),
     ]
     for s in scs:
         f = s.get("failure")
-        extra = (f", отказ R{s['robot_ids'][f['r']]} t={f['t']} v={f['v']}, план {f['orig_T']}→{s['makespan']}"
-                 if f else "")
+        extra = ("".join(f", отказ R{s['robot_ids'][x['r']]} t={x['t']} v={x['v']}" for x in f["list"])
+                 + f", план {f['orig_T']}→{s['makespan']}" if f else "")
         print(f"{s['name']}: T={s['makespan']}, доставлено {s['delivered']}/{len(s['orders'])}, "
               f"оптимум={s['optimal']}, событий {len(s['events'])}{extra}")
     print(export_html(scs, out))

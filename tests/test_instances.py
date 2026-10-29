@@ -1,10 +1,13 @@
 ﻿import copy
+import argparse
+from collections import Counter, deque
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
-from instances import create_instance, fingerprint, load_instance, save_instance, solver_inputs
+from instances import (add_geometry_arguments, create_instance, fingerprint,
+                       geometry_options, load_instance, save_instance, solver_inputs)
 
 
 class InstanceTests(unittest.TestCase):
@@ -72,6 +75,80 @@ class InstanceTests(unittest.TestCase):
         instance = create_instance(n=2, m=2, num_tasks=0, num_robots=1)
         self.assertEqual(instance['tasks'], [])
         self.assertEqual(len(instance['robots']), 1)
+
+
+class PlacementTests(unittest.TestCase):
+    make = InstanceTests.make
+
+    def test_random_defaults_keep_legacy_input_and_robot_fields(self):
+        legacy = self.make()
+        self.assertEqual(fingerprint(legacy),
+                         "89fc2fc89a9f54e63d19ec9042050eba3544f27bbfb6c2765b58e24f371bd1d5")
+        self.assertEqual(legacy, self.make(robot_placement="random", spawn_interval=2,
+                                           task_placement="random", min_task_distance=None))
+        self.assertTrue(all(set(robot) == {"robot_id", "start_vertex", "battery"}
+                            for robot in legacy["robots"]))
+        self.assertNotIn("placement", legacy["config"])
+
+    def test_corner_robots_enter_together_and_park_right_to_left(self):
+        instance = self.make(robot_placement="corner", spawn_interval=3)
+        cells, robots = instance["cells"], instance["robots"]
+        self.assertEqual([cells[r["start_vertex"]] for r in robots], [[0, 15], [0, 14], [0, 13]])
+        self.assertEqual([r["release_time"] for r in robots], [0, 3, 6])
+        self.assertTrue(all(cells[r["entry_vertex"]] == [0, 15] for r in robots))
+        self.assertEqual(len({r["start_vertex"] for r in robots}), 3)
+        self.assertEqual(instance["config"]["placement"]["spawn_interval"], 3)
+
+    def test_distant_tasks_meet_exact_bfs_distance_and_balance_directions(self):
+        instance = self.make(n=16, m=20, topology="cross_aisles", num_tasks=12,
+                             task_placement="distant", min_task_distance=24)
+        adjacency = [[] for _ in range(instance["num_vertices"])]
+        for a, b in instance["edges"]:
+            adjacency[a].append(b)
+            adjacency[b].append(a)
+        directions = []
+        for task in instance["tasks"]:
+            start, finish = task["start_vertex"], task["finish_vertex"]
+            distance, queue = {start: 0}, deque([start])
+            while queue:
+                vertex = queue.popleft()
+                for other in adjacency[vertex]:
+                    if other not in distance:
+                        distance[other] = distance[vertex] + 1
+                        queue.append(other)
+            self.assertGreaterEqual(distance[finish], 24)
+            a, b = instance["cells"][start], instance["cells"][finish]
+            directions.append((b[0] > a[0], b[1] > a[1]))
+        self.assertEqual(Counter(directions), {(True, True): 3, (False, False): 3,
+                                               (True, False): 3, (False, True): 3})
+        self.assertEqual(instance["config"]["placement"]["min_task_distance"], 24)
+
+    def test_new_modes_reproduce_and_default_distance_is_recorded(self):
+        options = dict(robot_placement="corner", task_placement="distant", placement_seed=9)
+        first = self.make(**options)
+        self.assertEqual(first, self.make(**options))
+        self.assertEqual(first["config"]["placement"]["min_task_distance"], 20)
+        self.assertNotEqual(first["tasks"], self.make(**(options | {"placement_seed": 10}))["tasks"])
+
+    def test_placement_cli_options_reach_instance_creation(self):
+        parser = argparse.ArgumentParser()
+        add_geometry_arguments(parser)
+        args = parser.parse_args(["--robot-placement", "corner", "--spawn-interval", "4",
+                                  "--task-placement", "distant", "--min-task-distance", "12"])
+        instance = self.make(**geometry_options(args))
+        self.assertEqual(instance["config"]["placement"],
+                         dict(robot_placement="corner", spawn_interval=4,
+                              task_placement="distant", min_task_distance=12))
+        self.assertNotIn("robot_placement", instance["config"]["geometry"])
+
+    def test_invalid_placement_settings_are_rejected(self):
+        for options in (dict(robot_placement="unknown"), dict(task_placement="unknown"),
+                        dict(spawn_interval=0), dict(spawn_interval=True),
+                        dict(spawn_interval=1.5), dict(min_task_distance=0),
+                        dict(robot_placement="corner", num_robots=17),
+                        dict(task_placement="distant", min_task_distance=10000)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.make(**options)
 
 
 if __name__ == '__main__':

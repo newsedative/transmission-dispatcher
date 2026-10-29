@@ -1,7 +1,18 @@
 """Physical replay of a saved plan, independent of the planner and visualizer."""
 
-from collections import Counter
 from dataclasses import asdict, is_dataclass
+
+
+def _check_occupancy(positions, transfers, tick):
+    """Only a real donor/receiver pair may share a vertex on this boundary."""
+    occupied = {}
+    for robot, vertex in positions.items():
+        if vertex is not None:
+            occupied.setdefault(vertex, []).append(robot)
+    for vertex, robots in occupied.items():
+        assert len(robots) == 1 or (len(robots) == 2 and
+               (vertex, frozenset(robots)) in transfers), f"Robots {robots} share vertex {vertex} without a transfer at tick {tick}"
+    return max(map(len, occupied.values()), default=0)
 
 
 def verify_result(instance, result):
@@ -37,15 +48,19 @@ def _replay(instance, result):
         assert first in adjacency and second in adjacency, "Invalid graph edge"
         adjacency[first].add(second)
         adjacency[second].add(first)
-    positions = {rid: r["start_vertex"] for rid, r in robots.items()}
+    releases = {rid: r.get("release_time", 0) for rid, r in robots.items()}
+    entries = {rid: r["start_vertex"] if r.get("entry_vertex") is None else r["entry_vertex"]
+               for rid, r in robots.items()}
+    assert all(type(t) is int and t >= 0 for t in releases.values()), "Invalid release time"
+    positions = {rid: entries[rid] if releases[rid] == 0 else None for rid in robots}
     battery = {rid: r["battery"] for rid, r in robots.items()}
     cargo_at = {tid: t["start_vertex"] for tid, t in tasks.items()}
     goals = {tid: t["finish_vertex"] for tid, t in tasks.items()}
     assert all(type(v) is int and v in adjacency
-               for v in (*positions.values(), *cargo_at.values(), *goals.values())), "Invalid initial vertex"
+               for v in (*entries.values(), *(r["start_vertex"] for r in robots.values()),
+                         *cargo_at.values(), *goals.values())), "Invalid initial vertex"
     assert all(type(b) is int and b >= 0 for b in battery.values()), "Invalid initial battery"
-    maximum_occupancy = max(Counter(positions.values()).values(), default=0)
-    assert maximum_occupancy <= 2, "Initial vertex capacity exceeded"
+    maximum_occupancy = _check_occupancy(positions, set(), 0)
     delivered_at = {tid: 0 for tid in tasks if cargo_at[tid] == goals[tid]}
     previous = {tid: None for tid in tasks}
     moving, busy, handoffs = [0], [0], 0
@@ -54,11 +69,16 @@ def _replay(instance, result):
         rows = ticks[tick]
         assert all(len(row) == 4 for row in rows), f"Invalid row at tick {tick}"
         assert len(rows) == len(robots) and {row[0] for row in rows} == robots.keys(), f"Robot rows at tick {tick}"
-        next_positions, carriers = {}, {}
+        next_positions, carriers, transfers = {}, {}, set()
         move_count = busy_count = 0
         for rid, vertex, cargo, reported_battery in rows:
-            assert type(vertex) is int and vertex in adjacency[positions[rid]], f"Illegal move by robot {rid} at tick {tick}"
-            moved = vertex != positions[rid]
+            if positions[rid] is None:
+                assert tick <= releases[rid] and cargo is None, f"Robot {rid} carries cargo before entry at tick {tick}"
+                assert vertex == (entries[rid] if tick == releases[rid] else None), f"Wrong appearance of robot {rid} at tick {tick}"
+                moved = False
+            else:
+                assert type(vertex) is int and vertex in adjacency[positions[rid]], f"Illegal move by robot {rid} at tick {tick}"
+                moved = vertex != positions[rid]
             battery[rid] -= moved
             assert type(reported_battery) is int and reported_battery == battery[rid] >= 0, f"Battery of robot {rid} at tick {tick}"
             move_count += moved
@@ -70,15 +90,14 @@ def _replay(instance, result):
                 donor = previous[cargo]
                 if donor is not None and donor != rid:
                     assert positions[donor] == positions[rid], f"Cargo {cargo} transfer without meeting at tick {tick}"
+                    transfers.add((positions[rid], frozenset((donor, rid))))
                     handoffs += 1
                 carriers[cargo] = rid
 
         for cargo, donor in previous.items():
             if donor is not None and cargo not in carriers:
                 assert cargo_at[cargo] == goals[cargo], f"Cargo {cargo} dropped before delivery at tick {tick}"
-        occupancy = max(Counter(next_positions.values()).values(), default=0)
-        maximum_occupancy = max(maximum_occupancy, occupancy)
-        assert occupancy <= 2, f"Vertex capacity exceeded at tick {tick}"
+        maximum_occupancy = max(maximum_occupancy, _check_occupancy(positions, transfers, tick - 1))
         for cargo, rid in carriers.items():
             vertex = next_positions[rid]
             if vertex != goals[cargo]:
@@ -91,6 +110,7 @@ def _replay(instance, result):
         moving.append(moving[-1] + move_count)
         busy.append(busy[-1] + busy_count)
 
+    maximum_occupancy = max(maximum_occupancy, _check_occupancy(positions, set(), makespan))
     delivered = sum(cargo_at[tid] == goals[tid] for tid in tasks)
     assert delivered == len(tasks), f"Only {delivered}/{len(tasks)} tasks delivered"
     last = max(delivered_at.values(), default=0)

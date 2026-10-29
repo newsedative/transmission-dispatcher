@@ -6,6 +6,7 @@ from dataclasses import asdict, replace
 from datetime import datetime
 import hashlib
 import json
+import networkx
 import ortools
 from pathlib import Path
 import sys
@@ -22,7 +23,7 @@ from visualize import export_html, scenario
 
 TOPOLOGIES = ("long_aisles", "cross_aisles", "zoned")
 SOURCE_FILES = ("warehouse.py", "instances.py", "benchmark.py", "validation.py", "test_run.py",
-                "greedy.py", "planners.py", "visualize.py", "viz_ops_template.html")
+                "greedy.py", "planners.py", "coordinated_routes.py", "visualize.py", "viz_ops_template.html")
 METRICS = ("delivered", "last_delivery_tick", "utilization", "movement_utilization",
            "handoffs", "total_moves", "busy_robot_ticks", "moving_robot_ticks",
            "robot_ticks_denominator")
@@ -59,10 +60,12 @@ def run_pair(instance, output, max_horizon=1024, time_limit_s=60, planner_seed=0
         destination = output / planner
         destination.mkdir()
         row = dict(case=output.name, planner=planner, max_horizon=max_horizon,
+                   occupancy_rule="one_robot_except_actual_transfer",
                    time_limit_s=time_limit_s, planner_seed=planner_seed,
                    input_checksum=expected, input_sha256=hashlib.sha256(input_bytes).hexdigest(),
                    phase="setup", status=None, high_level_status=None,
-                   source_sha256=source_hashes, runtime=dict(python=sys.version, ortools=ortools.__version__),
+                   source_sha256=source_hashes, runtime=dict(python=sys.version, ortools=ortools.__version__,
+                                                          networkx=networkx.__version__),
                    valid=False, error=None, full_route_optimality_proven=False,
                    **{key: None for key in METRICS})
         config = instance.get("config", {})
@@ -121,6 +124,7 @@ def run_pair(instance, output, max_horizon=1024, time_limit_s=60, planner_seed=0
                 result = solver.solve(robots, tasks, max_horizon=max_horizon, time_limit_s=time_limit_s)
             timings["solve"] = time.perf_counter() - before
             row["reported_route_status"] = result.solver_status
+            row["routing_method"] = getattr(solver, "last_routing_method", "cbs")
             row["status"] = "FEASIBLE" if result.success else result.solver_status
             write_json(destination / "result.json", asdict(result))
             if result.success:
@@ -164,7 +168,7 @@ def write_summary(rows, output):
         metric_definition="Mean moving-or-carrying robots / all robots, ticks 1..last physical delivery",
         time_unit="simulation tick", rows=rows))
     fields = ("case", "topology", "geometry_seed", "placement_seed", "n", "m", "vertices", "edges",
-              "robots", "tasks", "planner", "max_horizon", "status", "high_level_status", "valid", "delivered",
+              "robots", "tasks", "planner", "max_horizon", "occupancy_rule", "routing_method", "status", "high_level_status", "valid", "delivered",
               "last_delivery_tick", "utilization", "movement_utilization", "handoffs", "solve_seconds",
               "preprocessing_and_model_seconds", "native_cp_sat_seconds", "cp_objective", "cp_best_bound", "error")
     with (output / "results.csv").open("w", encoding="utf-8", newline="") as stream:
@@ -189,6 +193,10 @@ def main(argv=None):
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--placement-seed", type=int)
     parser.add_argument("--planner-seed", type=int, default=0)
+    parser.add_argument("--robot-placement", choices=("random", "corner"))
+    parser.add_argument("--spawn-interval", type=int)
+    parser.add_argument("--task-placement", choices=("random", "distant"))
+    parser.add_argument("--min-task-distance", type=int)
     parser.add_argument("--n", type=int, default=15)
     parser.add_argument("--m", type=int, default=20)
     parser.add_argument("--tasks", type=int, default=10)
@@ -225,7 +233,10 @@ def main(argv=None):
             profile, horizon = case.pop("profile"), case.pop("max_horizon")
             if args.placement_seed is not None:
                 case["placement_seed"] = args.placement_seed
-            parameters = {**case, **geometry}
+            placement = {name: getattr(args, name) for name in
+                         ("robot_placement", "spawn_interval", "task_placement", "min_task_distance")
+                         if getattr(args, name) is not None}
+            parameters = {**case, **geometry, **placement}
             name = f"{parameters['topology']}_seed{parameters['geometry_seed']}_{profile}"
             instance = create_instance(**parameters)
             rows.extend(run_pair(instance, output / name, args.horizon if args.horizon is not None else horizon,

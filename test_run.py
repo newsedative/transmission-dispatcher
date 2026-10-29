@@ -7,7 +7,7 @@ test_run.py
    и точной минимизацией makespan.
 2. Нижний уровень (CBS + Space-Time A*): потактовое хронологическое планирование
    с точной эвристикой, синхронизацией эстафет и полноценным Conflict-Based Search
-   по вместимости вершин (<= 2).
+   по вместимости вершин: один робот, двое только в момент передачи груза.
 
 Оптимизирован как для малых эталонов (passport), так и для сеток 128x128 (V > 16 000).
 Полностью совместим с failure.py и visualize.py.
@@ -31,6 +31,12 @@ class RobotSpec:
     robot_id: int
     start_vertex: int
     battery: int
+    release_time: int = 0
+    entry_vertex: Optional[int] = None
+
+    def __post_init__(self):
+        if type(self.release_time) is not int or self.release_time < 0:
+            raise ValueError("release_time must be a nonnegative integer")
 
 
 @dataclass(frozen=True)
@@ -44,7 +50,7 @@ class TaskSpec:
 class ScheduleResult:
     success: bool
     makespan: int
-    ticks: Dict[int, List[Tuple[int, int, Optional[int], int]]]
+    ticks: Dict[int, List[Tuple[int, Optional[int], Optional[int], int]]]
     handoff_events: List[str]
     solver_status: str
 
@@ -109,6 +115,27 @@ class SpaceTimeAStar:
         min_goal_t = max(min_goal_t, start_t + goal_dists[start_v])
         while (robot_id, goal_v, min_goal_t) in constraints:
             min_goal_t += 1
+        if min_goal_t > max_horizon:
+            return None
+
+        # Проверенный кратчайший путь обходится без поиска по времени.
+        vertex, battery = start_v, start_batt
+        direct_path = [(vertex, battery)]
+        while vertex != goal_v:
+            vertex = next(v for v in adj[vertex]
+                          if goal_dists[v] == goal_dists[vertex] - 1)
+            battery -= 1
+            direct_path.append((vertex, battery))
+        wait = min_goal_t - start_t - len(direct_path) + 1
+        # Приёмщик занимает точку встречи только к назначенному времени.
+        candidates = ([direct_path[0]] * wait + direct_path,
+                      direct_path + [direct_path[-1]] * wait)
+        for candidate in candidates:
+            if all((robot_id, v, start_t + i) not in constraints
+                   and blocked_vertices.get(v, 0) < max_capacity
+                   for i, (v, _) in enumerate(candidate)):
+                return candidate
+
         counter = 0
         h0 = max(goal_dists[start_v], max(0, min_goal_t - start_t))
         pq = [(start_t + h0, goal_dists[start_v], goal_dists[start_v], -start_t, counter,
@@ -193,19 +220,27 @@ class GraphHandoffCpSatSolver:
         time_limit_s: float = 60.0,
         blocked_vertices: Optional[Dict[int, int]] = None,
         allow_undelivered: bool = False,
+        blocked_cargo: Optional[Dict[int, int]] = None,
     ) -> ScheduleResult:
         start_time = time.time()
         blocked = blocked_vertices or {}
+        task_starts = {task.task_id: task.start_vertex for task in tasks}
+        if any(blocked.get(v) != 1 or task_starts.get(cargo) != v
+               for v, cargo in (blocked_cargo or {}).items()):
+            raise ValueError("blocked_cargo requires one frozen owner at the cargo start")
         R = len(robots)
         K = len(tasks)
 
         if K == 0 or R == 0:
+            initial = {r: [spec.entry_vertex if spec.entry_vertex is not None else spec.start_vertex]
+                       if spec.release_time == 0 else [None] for r, spec in enumerate(robots)}
+            success = K == 0 and (not R or self._find_vertex_conflict(initial, blocked) is None)
             return ScheduleResult(
-                success=True,
+                success=success,
                 makespan=0,
                 ticks={},
                 handoff_events=[],
-                solver_status="OPTIMAL",
+                solver_status="OPTIMAL" if success else "NO_PLAN",
             )
 
         elapsed = time.time() - start_time
@@ -237,9 +272,16 @@ class GraphHandoffCpSatSolver:
             max_horizon,
             blocked,
             time_limit_s=remaining_time,
+            blocked_cargo=blocked_cargo,
         )
 
         return low_level_result
+
+    def _deployment_state(self, robots):
+        distances = [self.oracle.dist(r.entry_vertex, r.start_vertex)
+                     if r.entry_vertex is not None else 0 for r in robots]
+        return ([r.release_time + d for r, d in zip(robots, distances)],
+                [r.battery - d for r, d in zip(robots, distances)])
 
     def _solve_high_level(
         self,
@@ -254,6 +296,10 @@ class GraphHandoffCpSatSolver:
         R = len(robots)
         K = len(tasks)
         INF = self.oracle.INF
+        ready, initial_battery = self._deployment_state(robots)
+        if any((b < 0 or t > max_horizon) and r.release_time <= max_horizon
+               for r, t, b in zip(robots, ready, initial_battery)):
+            return {"success": False, "status": "NO_PLAN"}
 
         # 1. Прогрев кэша дистанций для POI
         for r in robots:
@@ -265,7 +311,7 @@ class GraphHandoffCpSatSolver:
         # 2. Сбалансированный жадный Warm-Start (Min-Load Round-Robin)
         greedy_assigned: Dict[int, int] = {}
         cur_pos = [robots[r].start_vertex for r in range(R)]
-        avail_t = [0] * R
+        avail_t = ready.copy()
         task_count = [0] * R
         max_tasks_per_robot = math.ceil(K / R) + 1
 
@@ -332,7 +378,7 @@ class GraphHandoffCpSatSolver:
             A, B = task.start_vertex, task.finish_vertex
             d_AB = self.oracle.dist(A, B)
             cands = []
-            needs_relay = d_AB >= 2 and (d_AB > 4 or any(r.battery < d_AB for r in robots))
+            needs_relay = d_AB >= 2
             if needs_relay and d_AB < INF:
                 d_A = self.oracle.get_all_from(A)
                 d_B = self.oracle.get_all_from(B)
@@ -410,9 +456,18 @@ class GraphHandoffCpSatSolver:
             for r in cand_robots[k]:
                 d_init = self.oracle.dist(robots[r].start_vertex, A)
                 if d_init < INF:
-                    model.Add(t_start[k] >= d_init).OnlyEnforceIf(direct[k, r])
+                    model.Add(t_start[k] >= ready[r] + d_init).OnlyEnforceIf(direct[k, r])
+                    if d_init + self.oracle.dist(A, B) > initial_battery[r]:
+                        model.Add(direct[k, r] == 0)
                     for h in candidates[k]:
-                        model.Add(t_start[k] >= d_init).OnlyEnforceIf(leg1[k, r, h])
+                        model.Add(t_start[k] >= ready[r] + d_init).OnlyEnforceIf(leg1[k, r, h])
+                        if d_init + self.oracle.dist(A, h) > initial_battery[r]:
+                            model.Add(leg1[k, r, h] == 0)
+                        d_receiver = self.oracle.dist(robots[r].start_vertex, h)
+                        model.Add(t_start[k] + self.oracle.dist(A, h) >=
+                                  ready[r] + d_receiver).OnlyEnforceIf(leg2[k, r, h])
+                        if d_receiver + self.oracle.dist(h, B) > initial_battery[r]:
+                            model.Add(leg2[k, r, h] == 0)
 
         # 6. Дизъюнкции переходов
         tasks_for_robot: Dict[int, List[int]] = {r: [] for r in range(R)}
@@ -471,7 +526,7 @@ class GraphHandoffCpSatSolver:
                     if (k, r, h) in leg2 and self.oracle.dist(h, B) < INF:
                         energy_terms.append(leg2[k, r, h] * self.oracle.dist(h, B))
 
-            model.Add(sum(energy_terms) <= r_spec.battery)
+            model.Add(sum(energy_terms) <= max(0, initial_battery[r]))
 
         makespan = model.NewIntVar(0, max_horizon, "makespan")
         for k in range(K):
@@ -490,7 +545,7 @@ class GraphHandoffCpSatSolver:
 
         greedy_ms = 0
         for r in range(R):
-            t_now = 0
+            t_now = ready[r]
             p_now = robots[r].start_vertex
             for k in robot_tasks_order[r]:
                 task = tasks[k]
@@ -591,10 +646,20 @@ class GraphHandoffCpSatSolver:
         max_horizon: int,
         blocked: Dict[int, int],
         time_limit_s: float,
+        blocked_cargo=None,
     ) -> ScheduleResult:
         start_time = time.time()
         R = len(robots)
         scheduled_tasks = high_level["tasks"]
+        self.last_routing_method = "cbs"
+        if R >= 8 and not blocked:
+            from coordinated_routes import plan_routes
+
+            result = plan_routes(self, robots, tasks, scheduled_tasks, max_horizon,
+                                 min(30.0, time_limit_s))
+            if result is not None:
+                self.last_routing_method = "coordinated_moves"
+                return result
 
         all_legs = []
         for item in scheduled_tasks:
@@ -654,7 +719,7 @@ class GraphHandoffCpSatSolver:
                 continue
 
             paths, task_held = plan_res
-            conflict = self._find_vertex_conflict(paths, blocked)
+            conflict = self._find_vertex_conflict(paths, blocked, task_held, blocked_cargo)
             if conflict is None:
                 return self._build_schedule_result(
                     robots, tasks, paths, task_held, "OPTIMAL"
@@ -689,9 +754,26 @@ class GraphHandoffCpSatSolver:
         blocked: Dict[int, int],
     ) -> Optional[Tuple[Dict[int, List[int]], Dict[int, List[Optional[int]]]]]:
         R = len(robots)
-        paths: Dict[int, List[int]] = {r: [robots[r].start_vertex] for r in range(R)}
-        batt: Dict[int, List[int]] = {r: [robots[r].battery] for r in range(R)}
-        task_held: Dict[int, List[Optional[int]]] = {r: [None] for r in range(R)}
+        paths, batt, task_held = {}, {}, {}
+        for r, robot in enumerate(robots):
+            entry = robot.entry_vertex if robot.entry_vertex is not None else robot.start_vertex
+            release = robot.release_time
+            if release > max_horizon:
+                paths[r], batt[r], task_held[r] = [None], [robot.battery], [None]
+                continue
+            if ((r, entry, release) in constraints
+                    or blocked.get(entry, 0) >= self.max_robots_per_vertex):
+                return None
+            paths[r] = [None] * release + [entry]
+            batt[r] = [robot.battery] * (release + 1)
+            task_held[r] = [None] * (release + 1)
+            deployment = SpaceTimeAStar.plan(
+                r, entry, release, robot.battery, robot.start_vertex, release,
+                max_horizon, self.adj, self.oracle, constraints,
+                self.max_robots_per_vertex, blocked)
+            if deployment is None:
+                return None
+            self._apply_subpath(r, deployment, None, paths, batt, task_held)
 
         handoff_drops: Dict[Tuple[int, int], Tuple[int, int]] = {}
 
@@ -817,6 +899,27 @@ class GraphHandoffCpSatSolver:
                         len(paths[r]) - 1,
                     )
 
+        # Простаивающий робот освобождает ячейку, если этого требует CBS.
+        for r in range(R):
+            current_t, vertex = len(paths[r]) - 1, paths[r][-1]
+            forbidden = [t for who, v, t in constraints
+                         if who == r and v == vertex and t > current_t]
+            if not forbidden:
+                continue
+            for goal in [v for v in self.adj[vertex] if v != vertex] + [vertex]:
+                if blocked.get(goal, 0):
+                    continue
+                after = max((t + 1 for who, v, t in constraints if who == r and v == goal),
+                            default=current_t)
+                parking = SpaceTimeAStar.plan(
+                    r, vertex, current_t, batt[r][-1], goal, after, max_horizon,
+                    self.adj, self.oracle, constraints, self.max_robots_per_vertex, blocked)
+                if parking is not None:
+                    self._apply_subpath(r, parking, None, paths, batt, task_held)
+                    break
+            else:
+                return None
+
         # Выравнивание траекторий
         max_T = max(len(paths[r]) for r in range(R))
         for r in range(R):
@@ -841,17 +944,43 @@ class GraphHandoffCpSatSolver:
             task_held[r].append(carried_task)
 
     def _find_vertex_conflict(
-        self, paths: Dict[int, List[int]], blocked: Dict[int, int]
+        self, paths: Dict[int, List[int]], blocked: Dict[int, int], task_held=None,
+        blocked_cargo=None,
     ) -> Optional[Tuple[int, int, List[int]]]:
         T = max(len(p) for p in paths.values())
+        picked = set()
+        blocked_cargo = blocked_cargo or {}
         for t in range(T):
+            transfers = {}
+            if task_held is not None:
+                picked.update(held[t] for held in task_held.values()
+                              if t < len(held) and held[t] is not None)
+            if task_held is not None and t > 0:
+                donors = {held[t]: r for r, held in task_held.items()
+                          if t < len(held) and held[t] is not None}
+                for receiver, held in task_held.items():
+                    if t + 1 >= len(held):
+                        continue
+                    cargo = held[t + 1]
+                    donor = donors.get(cargo)
+                    if (donor is not None and donor != receiver
+                            and t + 1 < len(task_held[donor])
+                            and task_held[donor][t + 1] != cargo
+                            and paths[donor][t] == paths[receiver][t]):
+                        transfers[paths[receiver][t]] = {donor, receiver}
             occ: Dict[int, List[int]] = {}
             for r, p in paths.items():
-                if t < len(p):
+                if t < len(p) and p[t] is not None:
                     occ.setdefault(p[t], []).append(r)
             for v, rob_list in occ.items():
-                limit = self.max_robots_per_vertex - blocked.get(v, 0)
-                if len(rob_list) > limit:
+                transfer = len(rob_list) == 2 and set(rob_list) == transfers.get(v)
+                r = rob_list[0]
+                recovery = (len(rob_list) == 1 and blocked.get(v) == 1
+                            and v in blocked_cargo and blocked_cargo[v] not in picked
+                            and task_held is not None and t + 1 < len(task_held[r])
+                            and task_held[r][t + 1] == blocked_cargo[v])
+                limit = min(self.max_robots_per_vertex, 2 if transfer or recovery else 1)
+                if len(rob_list) + blocked.get(v, 0) > limit:
                     return v, t, rob_list
         return None
 
@@ -876,7 +1005,7 @@ class GraphHandoffCpSatSolver:
             for r in range(R):
                 u_curr = paths[r][t - 1]
                 v_next = paths[r][t]
-                if u_curr != v_next:
+                if u_curr is not None and v_next is not None and u_curr != v_next:
                     battery_left[r] -= 1
                 task_id = task_held[r][t] if t < len(task_held[r]) else None
                 row.append((robots[r].robot_id, v_next, task_id, battery_left[r]))

@@ -6,6 +6,30 @@ from test_run import GraphHandoffCpSatSolver, SpaceTimeAStar
 
 
 class TimedArrivalTests(unittest.TestCase):
+    def test_valid_shortest_route_with_long_wait_needs_no_search(self):
+        solver = GraphHandoffCpSatSolver(4, [(0, 1), (1, 2), (2, 3)])
+        with patch.object(test_run.heapq, 'heappush', side_effect=AssertionError('Search was unnecessary')):
+            path = SpaceTimeAStar.plan(0, 0, 0, 3, 3, 4000, 4000,
+                                      solver.adj, solver.oracle, {(0, 0, 20)}, 2, {})
+        self.assertEqual(path[0], (0, 3))
+        self.assertEqual(path[-1], (3, 0))
+        self.assertEqual(len(path), 4001)
+
+    def test_appointment_does_not_reserve_a_busy_meeting_cell_early(self):
+        solver = GraphHandoffCpSatSolver(4, [(0, 1), (1, 2), (2, 3)])
+        occupied = {(0, 3, t) for t in range(4000)}
+        with patch.object(test_run.heapq, 'heappush', side_effect=AssertionError('Search was unnecessary')):
+            path = SpaceTimeAStar.plan(0, 0, 0, 3, 3, 4000, 4000,
+                                      solver.adj, solver.oracle, occupied, 2, {})
+        self.assertEqual(path[-1], (3, 0))
+        self.assertTrue(all(v != 3 for v, _ in path[:-1]))
+
+    def test_shortest_route_falls_back_when_a_cell_is_fully_blocked(self):
+        solver = GraphHandoffCpSatSolver(4, [(0, 1), (1, 3), (0, 2), (2, 3)])
+        path = SpaceTimeAStar.plan(0, 0, 0, 2, 3, 0, 4,
+                                  solver.adj, solver.oracle, set(), 2, {1: 2})
+        self.assertEqual(path, [(0, 2), (2, 1), (3, 0)])
+
     def test_long_wait_does_not_expand_the_whole_time_grid(self):
         edges = [(v, v + d) for v in range(64) for d in (1, 8)
                  if v + d < 64 and (d != 1 or v // 8 == (v + 1) // 8)]

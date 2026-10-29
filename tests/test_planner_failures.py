@@ -40,20 +40,21 @@ class PlannerFailureTests(unittest.TestCase):
         self.assertEqual(run.result.ticks[1][0][1], 1)
 
     def test_failure_at_initial_tick_keeps_frozen_battery(self):
-        edges = [(0, 1), (1, 2)]
-        robots = [RobotSpec(1, 0, 5), RobotSpec(2, 0, 5)]
-        tasks = [TaskSpec(1, 0, 2)]
+        edges = [(0, 1), (1, 2), (2, 3)]
+        robots = [RobotSpec(1, 0, 5), RobotSpec(2, 3, 5)]
+        tasks = [TaskSpec(1, 1, 2)]
         run = run_with_failure(
-            3, edges, robots, tasks, forced=(1, 0), planner="greedy", planner_seed=42
+            4, edges, robots, tasks, forced=(1, 0), planner="greedy", planner_seed=42
         )
         self.assertTrue(run.result.success)
         for rows in run.result.ticks.values():
             self.assertEqual(next(row for row in rows if row[0] == 1), (1, 0, None, 5))
-        view = failure_scenario(3, edges, robots, tasks, run, "initial", coords=[[0, 0], [0.5, 0], [1, 0]])
+        view = failure_scenario(4, edges, robots, tasks, run, "initial",
+                                coords=[[v / 3, 0] for v in range(4)])
         self.assertEqual(view["delivered"], 1)
         self.assertFalse(view["optimal"])
 
-    def test_failure_before_at_and_after_handoff_preserves_cargo(self):
+    def test_failure_before_at_and_after_handoff_obeys_occupancy(self):
         edges = [(v, v + 1) for v in range(4)]
         robots = [RobotSpec(1, 0, 10), RobotSpec(2, 2, 10)]
         tasks = [TaskSpec(1, 0, 4)]
@@ -61,6 +62,13 @@ class PlannerFailureTests(unittest.TestCase):
         self.assertTrue(original.handoff_events)
         for forced in [(1, 1), (1, 2), (2, 2), (2, 3)]:
             with self.subTest(forced=forced):
+                if forced == (2, 2):
+                    # Пустой приёмщик сломался до передачи: два робота уже
+                    # находятся вместе, а фактической передачи не будет.
+                    with self.assertRaisesRegex(RuntimeError, 'NO_PLAN'):
+                        run_with_failure(5, edges, robots, tasks, original=original,
+                                         forced=forced, planner='greedy', planner_seed=42)
+                    continue
                 run = run_with_failure(
                     5, edges, robots, tasks, original=original, forced=forced,
                     planner="greedy", planner_seed=42,

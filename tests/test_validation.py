@@ -48,7 +48,8 @@ class ValidationTests(unittest.TestCase):
 
     def test_trailing_empty_motion_does_not_extend_delivery_window(self):
         result = copy.deepcopy(RESULT)
-        result["ticks"]["4"][1] = [20, 1, None, 3]
+        result["ticks"]["4"][0] = [10, 0, None, 3]
+        result["ticks"]["4"][1] = [20, 2, None, 4]
         report = verify_result(INSTANCE, result)
         self.assertEqual(report["last_delivery_tick"], 3)
         self.assertEqual(report["total_moves"], 3)

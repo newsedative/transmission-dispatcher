@@ -69,6 +69,7 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(row["last_delivery_tick"], 1)
                 self.assertEqual(row["utilization"], 1)
                 self.assertFalse(row["full_route_optimality_proven"])
+                self.assertEqual(row['occupancy_rule'], 'one_robot_except_actual_transfer')
                 self.assertIn("benchmark.py", row["source_sha256"])
                 self.assertIn("python", row["runtime"])
                 self.assertIn("ortools", row["runtime"])
@@ -162,6 +163,22 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual({case["geometry_seed"] for case in cases}, {42, 43})
         self.assertEqual({case["num_tasks"] for case in cases}, {3, 8})
         self.assertEqual(len({(c["topology"], c["geometry_seed"], c["num_tasks"]) for c in cases}), 12)
+
+    def test_placement_options_reach_the_saved_input(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "experiment"
+            with patch("benchmark.run_pair", return_value=[]) as pair:
+                main(["--output", str(output), "--topologies", "cross_aisles",
+                      "--n", "8", "--m", "12", "--tasks", "4", "--robots", "3",
+                      "--robot-placement", "corner", "--spawn-interval", "3",
+                      "--task-placement", "distant", "--min-task-distance", "12"])
+            configuration = json.loads((output / 'configuration.json').read_text())
+            self.assertEqual(configuration['robot_placement'], 'corner')
+            self.assertEqual(configuration['spawn_interval'], 3)
+            instance = pair.call_args.args[0]
+            self.assertEqual([r['release_time'] for r in instance['robots']], [0, 3, 6])
+            self.assertEqual(len({r['entry_vertex'] for r in instance['robots']}), 1)
+            self.assertEqual(instance['config']['placement']['min_task_distance'], 12)
 
 
 if __name__ == "__main__":

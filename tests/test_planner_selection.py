@@ -57,16 +57,16 @@ class PlannerSelectionTests(unittest.TestCase):
         self.assertTrue(all(s["delivered"] == 1 and not s["optimal"] for s in scenarios))
 
     def test_failure_replans_with_greedy(self):
-        edges = [(0, 1), (1, 2)]
-        robots = [RobotSpec(1, 0, 10), RobotSpec(2, 0, 10)]
-        tasks = [TaskSpec(1, 0, 2)]
+        edges = [(0, 1), (1, 2), (2, 3)]
+        robots = [RobotSpec(1, 0, 10), RobotSpec(2, 1, 10)]
+        tasks = [TaskSpec(1, 1, 3)]
         with patch.object(cp_model, "CpSolver", side_effect=AssertionError("SAT called")):
             run = failure.run_with_failure(
-                3, edges, robots, tasks, forced=(1, 1), max_horizon=10,
+                4, edges, robots, tasks, forced=(1, 1), max_horizon=10,
                 planner="greedy", planner_seed=42,
             )
         scenario = visualize.failure_scenario(
-            3, edges, robots, tasks, run, "failure", coords=[[0, 0], [0.5, 0], [1, 0]]
+            4, edges, robots, tasks, run, "failure", coords=[[v / 3, 0] for v in range(4)]
         )
         self.assertIsNotNone(run.failure)
         self.assertEqual(run.replan.solver_status, "FEASIBLE")

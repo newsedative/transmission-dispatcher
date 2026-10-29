@@ -15,12 +15,13 @@ class GreedyHandoffSolver(GraphHandoffCpSatSolver):
         self.handoff_probability = handoff_probability
 
     def solve(self, robots, tasks, max_horizon=60, allow_floor_drop=False,
-              time_limit_s=60.0, blocked_vertices=None, allow_undelivered=False):
+              time_limit_s=60.0, blocked_vertices=None, allow_undelivered=False,
+              blocked_cargo=None):
         if tasks and not robots:
             status = "FEASIBLE" if allow_undelivered else "NO_PLAN"
             return ScheduleResult(allow_undelivered, 0, {}, [], status)
         result = super().solve(robots, tasks, max_horizon, allow_floor_drop,
-                               time_limit_s, blocked_vertices, allow_undelivered)
+                               time_limit_s, blocked_vertices, allow_undelivered, blocked_cargo)
         if result.success:
             result.solver_status = "FEASIBLE"
         return result
@@ -29,8 +30,10 @@ class GreedyHandoffSolver(GraphHandoffCpSatSolver):
                           allow_undelivered, time_limit_s):
         rng = random.Random(self.seed)
         positions = [r.start_vertex for r in robots]
-        battery = [r.battery for r in robots]
-        available = [0] * len(robots)
+        available, battery = self._deployment_state(robots)
+        if any((b < 0 or t > max_horizon) and r.release_time <= max_horizon
+               for r, t, b in zip(robots, available, battery)):
+            return {"success": False, "status": "NO_PLAN"}
         plan = []
         closed = {v for v, count in blocked.items() if count >= self.max_robots_per_vertex}
         oracle = self.oracle

@@ -35,7 +35,7 @@ from test_run import GraphHandoffCpSatSolver, RobotSpec, ScheduleResult, TaskSpe
 from failure import FailureRun, run_with_failure
 from planners import create_solver
 from instances import create_instance, solver_inputs
-from validation import verify_result
+from validation import _check_occupancy, verify_result
 
 TEMPLATE = Path(__file__).with_name("viz_ops_template.html")
 
@@ -63,7 +63,8 @@ def plan_from_ticks(robots: List[RobotSpec], tasks: List[TaskSpec], res: Schedul
     """ticks решателя -> pos[r][t] (вершина в момент t), hold[r][t] (индекс груза на шаге t -> t+1)."""
     T = res.makespan
     k_of = {t.task_id: k for k, t in enumerate(tasks)}
-    pos = [[r.start_vertex] for r in robots]
+    pos = [[(r.start_vertex if getattr(r, "entry_vertex", None) is None else r.entry_vertex)
+            if getattr(r, "release_time", 0) == 0 else None] for r in robots]
     hold: List[List[Optional[int]]] = [[] for _ in robots]
     for t in range(1, T + 1):
         rows = {row[0]: row for row in res.ticks[t]}
@@ -115,28 +116,38 @@ def validate(num_vertices: int, edges, robots: List[RobotSpec], tasks: List[Task
         adj[u].add(v)
         adj[v].add(u)
     for r, spec in enumerate(robots):
+        release = getattr(spec, "release_time", 0)
+        entry = spec.start_vertex if getattr(spec, "entry_vertex", None) is None else spec.entry_vertex
+        assert type(release) is int and release >= 0, f"R{spec.robot_id}: неверное время выхода"
+        assert pos[r][0] == (entry if release == 0 else None), f"R{spec.robot_id}: неверная начальная позиция"
         moves = 0
         for t in range(T):
             a, b = pos[r][t], pos[r][t + 1]
-            assert b in adj[a], f"R{spec.robot_id}: нет ребра {a}-{b} на шаге {t}"
-            moves += a != b
+            if a is None:
+                assert t + 1 <= release and b == (entry if t + 1 == release else None), f"R{spec.robot_id}: неверное появление на шаге {t}"
+                assert hold[r][t] is None, f"R{spec.robot_id}: груз до появления"
+            else:
+                assert b in adj[a], f"R{spec.robot_id}: нет ребра {a}-{b} на шаге {t}"
+                moves += a != b
         assert moves <= spec.battery, f"R{spec.robot_id}: потрачено {moves} > заряда {spec.battery}"
-    for t in range(T + 1):
-        occ: Dict[int, int] = {}
-        for r in range(len(robots)):
-            occ[pos[r][t]] = occ.get(pos[r][t], 0) + 1
-        assert max(occ.values(), default=0) <= max_robots_per_vertex, f"больше {max_robots_per_vertex} роботов в вершине, t={t}"
-    delivered = 0
+    delivered, transfers = 0, {}
     for k, task in enumerate(tasks):
-        at = task.start_vertex
+        at, previous = task.start_vertex, None
         for t in range(T):
             carriers = [r for r in range(len(robots)) if hold[r][t] == k]
             assert len(carriers) <= 1, f"груз {task.task_id} несут несколько роботов, t={t}"
             if carriers:
                 r = carriers[0]
                 assert pos[r][t] == at, f"груз {task.task_id}: робот не там, где груз, t={t}"
+                if previous is not None and previous != r:
+                    assert pos[previous][t] == pos[r][t], f"груз {task.task_id}: передача без встречи, t={t}"
+                    transfers.setdefault(t, set()).add((pos[r][t], frozenset((previous, r))))
                 at = pos[r][t + 1]
+            previous = carriers[0] if carriers else None
         delivered += at == task.finish_vertex
+    for t in range(T + 1):
+        count = _check_occupancy({r: pos[r][t] for r in range(len(robots))}, transfers.get(t, set()), t)
+        assert count <= max_robots_per_vertex, f"больше {max_robots_per_vertex} роботов в вершине, t={t}"
     return delivered
 
 
@@ -159,6 +170,9 @@ def scenario(num_vertices: int, edges, robots: List[RobotSpec], tasks: List[Task
         "edges": [[u, v, 1] for u, v in edges],        # в паспорте ребро = 1 такт = 1 ед. заряда
         "robots": [[r.start_vertex, r.battery] for r in robots],
         "robot_ids": [r.robot_id for r in robots],
+        "release_times": [getattr(r, "release_time", 0) for r in robots],
+        "entry_vertices": [getattr(r, "entry_vertex", None) for r in robots],
+        "occupancy_rule": "one_robot_except_actual_transfer",
         "orders": [[t.start_vertex, t.finish_vertex] for t in tasks],
         "order_ids": [t.task_id for t in tasks],
         "coords": coords or auto_coords(num_vertices, edges),

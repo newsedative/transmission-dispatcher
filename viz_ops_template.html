@@ -157,7 +157,8 @@ select {
 .lg-route { width: 18px; height: 3px; background: linear-gradient(90deg, #5cc8ff, #b48cff); }
 .lg-parcel { width: 9px; height: 9px; background: var(--parcel); box-shadow: 0 0 6px var(--parcel); transform: rotate(45deg) skew(-8deg, -8deg); }
 .lg-target { width: 11px; height: 11px; border: 1.5px dashed var(--parcel); transform: rotate(45deg); }
-.lg-full { width: 12px; height: 7px; border: 2px solid var(--orange); border-radius: 50%; }
+.lg-full, .lg-conflict { width: 12px; height: 7px; border: 2px solid var(--cyan); border-radius: 50%; }
+.lg-conflict { border-color: var(--red); }
 .lg-fail { width: 10px; height: 10px; border-radius: 50%; background: var(--red); box-shadow: 0 0 8px var(--red); }
 .lg-cancel { width: 18px; height: 0; border-top: 2px dashed var(--red); opacity: 0.8; }
 .legend .fo[hidden] { display: none; }
@@ -308,7 +309,8 @@ select {
           <span><i class="lg-route"></i>план маршрута</span>
           <span><i class="lg-parcel"></i>заказ ждёт</span>
           <span><i class="lg-target"></i>точка сдачи</span>
-          <span><i class="lg-full"></i>вершина занята 2/2</span>
+          <span><i class="lg-full"></i>два робота при передаче</span>
+          <span><i class="lg-conflict"></i>конфликт вместимости</span>
           <span class="fo" hidden><i class="lg-fail"></i>робот отказал</span>
           <span class="fo" hidden><i class="lg-cancel"></i>отменённый план</span>
         </div>
@@ -366,11 +368,43 @@ function prepare(s) {
     wt.set(u + "," + v, w); wt.set(v + "," + u, w);
     minInc[u] = Math.min(minInc[u], w); minInc[v] = Math.min(minInc[v], w);
   }
-  s.w = (a, b) => a === b ? 0 : (wt.get(a + "," + b) ?? 0);
+  s.w = (a, b) => a === null || b === null || a === b ? 0 : (wt.get(a + "," + b) ?? 0);
   s.L = v => s.labels ? s.labels[v] : String(v);
   s.stepE = s.robots.map((_, r) => Array.from({ length: T }, (_, t) => s.w(s.pos[r][t], s.pos[r][t + 1])));
   s.used = s.robots.map((_, r) => { const u = [0]; for (let t = 0; t < T; t++) u.push(u[t] + s.stepE[r][t]); return u; });
-  s.stuck = s.robots.map(([, cap], r) => s.used[r].map((u, t) => cap - u < minInc[s.pos[r][t]]));
+  s.stuck = s.robots.map(([, cap], r) => s.used[r].map((u, t) => s.pos[r][t] !== null && cap - u < minInc[s.pos[r][t]]));
+  s.transferPairs = Array.from({ length: T + 1 }, () => []);
+  const addCarrier = (map, cargo, r) => {
+    if (cargo == null) return;
+    if (!map.has(cargo)) map.set(cargo, []);
+    map.get(cargo).push(r);
+  };
+  for (let t = 1; t < T; t++) {
+    const before = new Map(), after = new Map();
+    for (let r = 0; r < R; r++) {
+      addCarrier(before, s.hold[r][t - 1], r);
+      addCarrier(after, s.hold[r][t], r);
+    }
+    for (const [cargo, donors] of before) {
+      const receivers = after.get(cargo) || [];
+      if (donors.length !== 1 || receivers.length !== 1) continue;
+      const [donor, receiver] = [donors[0], receivers[0]], vertex = s.pos[donor][t];
+      if (donor !== receiver && vertex != null && vertex === s.pos[receiver][t])
+        s.transferPairs[t].push({ vertex, robots: [donor, receiver], cargo });
+    }
+  }
+  s.occupancyAt = t => {
+    const slots = new Map();
+    for (let r = 0; r < R; r++) {
+      const vertex = s.pos[r][t];
+      if (vertex == null) continue;
+      if (!slots.has(vertex)) slots.set(vertex, []);
+      slots.get(vertex).push(r);
+    }
+    return [...slots].map(([vertex, robots]) => ({ vertex, robots,
+      kind: robots.length === 1 ? "normal" : robots.length === 2 && (s.transferPairs[t] || [])
+        .some(pair => pair.vertex === vertex && pair.robots.every(r => robots.includes(r))) ? "transfer" : "conflict" }));
+  };
   s.pickT = s.orders.map(() => null); s.doneT = s.orders.map(() => null);
   for (const [t, kind, k] of s.events) {
     if (kind === "pickup" && s.pickT[k] === null) s.pickT[k] = t;
@@ -395,7 +429,7 @@ function prepare(s) {
     const h = Array(T + 1).fill(null); let cur = null;
     for (let t = 0; t < T; t++) {
       const a = s.pos[r][t], b = s.pos[r][t + 1];
-      if (a !== b) {
+      if (a !== null && b !== null && a !== b) {
         const dx = s.coords[b][0] - s.coords[a][0], dy = s.coords[b][1] - s.coords[a][1];
         cur = Math.abs(dx) >= Math.abs(dy) ? [0, Math.sign(dx) || 1] : [1, Math.sign(dy) || 1];
       }
@@ -409,6 +443,10 @@ function prepare(s) {
   const F0 = s.failure, T0 = F0 ? F0.orig_T : s.makespan, D0 = F0 ? F0.orig_done.filter(d => d !== null).length : s.delivered;
   const log = [{ t: 0, kind: "sys", text: `План загружен: ${D0} из ${s.orders.length} заказов за ${T0} ${plural(T0, "ход", "хода", "ходов")}` +
     (F0 && F0.p != null ? ` · риск отказа ${Math.round(F0.p * 100)}% за ход` : "") }];
+  (s.release_times || []).forEach((t, r) => {
+    if (t > 0 && t <= s.makespan && s.pos[r][t] !== null)
+      log.push({ t, kind: "sys", text: `${rid(r)} вышел · вершина ${s.L(s.pos[r][t])}` });
+  });
   for (const [t, kind, k, who, v] of s.events) {
     if (kind === "pickup") log.push({ t, kind, text: `${rid(who)} забрал заказ #${oid(k)} · вершина ${s.L(v)}` });
     if (kind === "deliver") log.push({ t, kind, text: `${rid(who)} сдал заказ #${oid(k)} · вершина ${s.L(v)}` });
@@ -427,6 +465,7 @@ function prepare(s) {
   s.robots.forEach(([, cap], r) => {
     let lowDone = false, stuckPrev = false;
     for (let t = 0; t <= T; t++) {
+      if (s.pos[r][t] === null) continue;
       const left = cap - s.used[r][t], pct = cap ? left / cap * 100 : 0, st = s.stuck[r][t];
       if (st && !stuckPrev) { log.push({ t, kind: "dead", text: `${rid(r)}: заряда не хватает ни на одно ребро (${fmt1(left)} ед.)` }); lowDone = true; }
       else if (!lowDone && pct <= 25) { log.push({ t, kind: "low", text: `${rid(r)}: низкий заряд ${Math.round(pct)}%` }); lowDone = true; }
@@ -442,6 +481,7 @@ function prepare(s) {
 const pctAt = (r, t) => { const cap = S.robots[r][1]; return cap ? (cap - S.used[r][t]) / cap * 100 : 0; };
 const lvl = (pct, dead) => dead ? COL.red : pct > 50 ? COL.green : pct > 25 ? COL.amber : COL.orange;
 function rstatus(r, k) {
+  if (S.pos[r][k] === null) return ["Ожидает выхода", COL.cyan];
   if (S.broken[r][k]) return ["Отказ", COL.red];
   if (k < S.T && S.pos[r][k] !== S.pos[r][k + 1]) return ["В пути", COL.green];
   if (S.stuck[r][k]) return ["Разряжен", COL.red];
@@ -505,7 +545,9 @@ function groundQuad(x, y, R0) {                     // a layout-aligned square t
 }
 
 function slotScr(r, t) {
-  const v = S.pos[r][t], [x, y] = S.scr[v];
+  const v = S.pos[r][t];
+  if (v === null) return null;
+  const [x, y] = S.scr[v];
   let idx = 0, cnt = 0;
   for (let i = 0; i < S.R; i++) if (S.pos[i][t] === v) { cnt++; if (i < r) idx++; }
   if (cnt < 2) return [x, y];
@@ -515,7 +557,9 @@ function slotScr(r, t) {
 function robotScreen(k, e) {
   const out = [];
   for (let r = 0; r < S.R; r++) {
-    const a = slotScr(r, k), b = k < S.T ? slotScr(r, k + 1) : a;
+    const a = slotScr(r, k);
+    if (a === null) { out.push(null); continue; }
+    const b = k < S.T ? (slotScr(r, k + 1) || a) : a;
     let x = a[0] + (b[0] - a[0]) * e, y = a[1] + (b[1] - a[1]) * e;
     if (k < S.T) {
       const u = S.pos[r][k], v = S.pos[r][k + 1];
@@ -710,9 +754,9 @@ function draw(now) {
   // Before a failure the dispatcher only knows the original plan, so that is what is drawn.
   const F = S.failure, P = F && k < F.t ? F.orig_pos : S.pos, PT = P[0].length - 1;
   for (let r = 0; r < S.R; r++) {
-    if (S.broken[r][k]) continue;
+    if (S.broken[r][k] || rp[r] === null) continue;
     const pts = [rp[r]];
-    for (let t = k + 1; t <= PT; t++) { const v = P[r][t]; if (v !== P[r][t - 1]) pts.push(S.scr[v]); }
+    for (let t = k + 1; t <= PT; t++) { const v = P[r][t]; if (v !== null && v !== P[r][t - 1]) pts.push(S.scr[v]); }
     if (pts.length < 2) continue;
     const off = (r - (S.R - 1) / 2) * Math.min(3, fit.md * 0.5 / S.R);
     ctx.strokeStyle = hexA(rc(r), selected === r ? 0.95 : dim(r) ? 0.1 : 0.42);
@@ -731,8 +775,9 @@ function draw(now) {
     const a = 1 - (time - F.t) / 3;
     ctx.setLineDash([3, 6]); ctx.lineWidth = 2;
     for (let r = 0; r < S.R; r++) {
+      if (F.orig_pos[r][F.t] === null) continue;
       const pts = [S.scr[F.orig_pos[r][F.t]]];
-      for (let t = F.t + 1; t <= F.orig_T; t++) { const v = F.orig_pos[r][t]; if (v !== F.orig_pos[r][t - 1]) pts.push(S.scr[v]); }
+      for (let t = F.t + 1; t <= F.orig_T; t++) { const v = F.orig_pos[r][t]; if (v !== null && v !== F.orig_pos[r][t - 1]) pts.push(S.scr[v]); }
       if (pts.length < 2) continue;
       const off = (r - (S.R - 1) / 2) * Math.min(3, fit.md * 0.5 / S.R);
       ctx.strokeStyle = hexA(COL.red, a * (r === F.r ? 0.85 : 0.45));
@@ -744,9 +789,9 @@ function draw(now) {
     ctx.setLineDash([]);
   }
   // past route of the selected robot
-  if (selected !== null) {
+  if (selected !== null && rp[selected] !== null) {
     const r = selected, pts = [];
-    for (let t = 0; t <= k; t++) { const v = S.pos[r][t]; if (!pts.length || v !== S.pos[r][t - 1]) pts.push(S.scr[v]); }
+    for (let t = 0; t <= k; t++) { const v = S.pos[r][t]; if (v !== null && (!pts.length || v !== S.pos[r][t - 1])) pts.push(S.scr[v]); }
     pts.push(rp[r]);
     ctx.strokeStyle = hexA(rc(r), 0.35); ctx.lineWidth = 2; ctx.setLineDash([2, 5]);
     for (let i = 0; i + 1 < pts.length; i++) seg(ctx, pts[i], pts[i + 1]);
@@ -755,7 +800,7 @@ function draw(now) {
   // active moves: lit trail behind the robot, flowing dashes ahead of it
   if (k < T) for (let r = 0; r < S.R; r++) {
     const u = S.pos[r][k], v = S.pos[r][k + 1];
-    if (u === v) continue;
+    if (u === null || v === null || u === v) continue;
     const a = S.scr[u], b = S.scr[v];
     ctx.shadowColor = rc(r); ctx.shadowBlur = 14;
     ctx.strokeStyle = hexA(rc(r), dim(r) ? 0.25 : 0.95); ctx.lineWidth = 4;
@@ -765,17 +810,16 @@ function draw(now) {
     seg(ctx, rp[r], b);
     ctx.setLineDash([]); ctx.lineDashOffset = 0; ctx.shadowBlur = 0;
   }
-  // vertices at capacity (2 robots) at the nearest moment
-  const m = p < 0.5 ? k : Math.min(k + 1, T);
-  const occ = new Map();
-  for (let r = 0; r < S.R; r++) occ.set(S.pos[r][m], (occ.get(S.pos[r][m]) || 0) + 1);
-  for (const [v, cnt] of occ) if (cnt >= 2) {
+  // Two robots may share a vertex only at a physical cargo transfer boundary.
+  const m = k;
+  for (const {vertex:v, robots, kind} of S.occupancyAt(m)) if (robots.length >= 2) {
     const [x, y] = S.scr[v], R0 = 25 * vs;
-    ctx.shadowColor = COL.orange; ctx.shadowBlur = 12;
-    ellipse(ctx, x, y, R0, R0 / 2); ctx.strokeStyle = hexA(COL.orange, 0.9); ctx.lineWidth = 2; ctx.stroke();
+    const color = kind === "transfer" ? COL.cyan : COL.red;
+    ctx.shadowColor = color; ctx.shadowBlur = 12;
+    ellipse(ctx, x, y, R0, R0 / 2); ctx.strokeStyle = hexA(color, 0.9); ctx.lineWidth = 2; ctx.stroke();
     ctx.shadowBlur = 0;
-    ctx.font = "600 10px 'JetBrains Mono', monospace"; ctx.textAlign = "center"; ctx.fillStyle = COL.orange;
-    ctx.fillText("2/2", x, y + R0 / 2 + 12);
+    ctx.font = "600 10px 'JetBrains Mono', monospace"; ctx.textAlign = "center"; ctx.fillStyle = color;
+    ctx.fillText(kind === "transfer" ? "передача" : `конфликт ${robots.length}/1`, x, y + R0 / 2 + 12);
   }
   // order targets (B) and waiting parcels (A)
   const tgt = new Map(), wait = new Map(), done = new Map();
@@ -863,7 +907,7 @@ function draw(now) {
     }
   }
   // robots, back to front
-  const order = [...Array(S.R).keys()].sort((a, b) => rp[a][1] - rp[b][1]);
+  const order = [...Array(S.R).keys()].filter(r => rp[r] !== null).sort((a, b) => rp[a][1] - rp[b][1]);
   hits = [];
   for (const r of order) {
     const h = S.hold[r][k], br = S.broken[r][k];
@@ -980,6 +1024,7 @@ function updatePanels() {
     R.led.style.background = c; R.led.style.boxShadow = `0 0 8px ${c}`;
     R.stt.textContent = st; R.stt.style.color = c;
     R.sm.textContent = st === "В пути" ? `${S.L(S.pos[r][k])} → ${S.L(S.pos[r][k + 1])}`
+      : st === "Ожидает выхода" ? `выход на такте ${(S.release_times || [])[r] ?? "—"}`
       : st === "Отказ" ? `${S.L(F.v)} · t=${F.t}` : `вершина ${S.L(S.pos[r][k])}`;
     R.b.classList.toggle("broken", S.broken[r][k]);
     let h = S.hold[r][k];
@@ -997,7 +1042,8 @@ function updatePanels() {
   const fl = !F ? "" : failed
     ? `<div class="ctr bad">Отказ <b>${rid(F.r)}</b> · ход ${F.t}</div><div class="ctr bad">План <b>${F.orig_T} → ${T}</b></div>`
     : F.p != null ? `<div class="ctr">Риск отказа <b>${Math.round(F.p * 100)}%</b>/ход</div>` : "";
-  ctr.innerHTML = `<div class="ctr">В строю <b>${S.R - (failed ? 1 : 0)}/${S.R}</b></div><div class="ctr">В пути <b>${moving}</b></div>
+  const present = S.pos.filter((path, r) => path[k] !== null && !S.broken[r][k]).length;
+  ctr.innerHTML = `<div class="ctr">В строю <b>${present}/${S.R}</b></div><div class="ctr">В пути <b>${moving}</b></div>
     <div class="ctr">Заказы в работе <b>${held}</b></div><div class="ctr">Доставлено <b>${S.cumDel[k]}/${S.orders.length}</b></div>${fl}${opt}`;
   S.ochips.forEach((c, o) => {
     const st = orderState(o, k), [a, b] = S.orders[o];
@@ -1022,8 +1068,9 @@ function updatePanels() {
   const tot = k < T ? S.stepE.reduce((s, x) => s + x[k], 0) : 0;
   const all = S.used.reduce((s, u) => s + u[k], 0);
   $("r2").textContent = k < T ? `ход ${k}→${k + 1}: ${fmt1(tot)} ед. · всего ${fmt1(all)}` : `всего ${fmt1(all)} ед.`;
-  const mins = S.robots.map((_, r) => S.broken[r][k] ? Infinity : pctAt(r, k));
-  $("r3").textContent = `мин ${Math.round(Math.min(...mins))}% · ${rid(mins.indexOf(Math.min(...mins)))}`;
+  const mins = S.robots.map((_, r) => S.broken[r][k] || S.pos[r][k] === null ? Infinity : pctAt(r, k));
+  const lowest = Math.min(...mins);
+  $("r3").textContent = Number.isFinite(lowest) ? `мин ${Math.round(lowest)}% · ${rid(mins.indexOf(lowest))}` : "Ожидают выхода";
   shadeCharts();
 }
 

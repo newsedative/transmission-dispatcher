@@ -104,6 +104,8 @@ class SpaceTimeAStar:
         blocked_vertices: Dict[int, int],
     ) -> Optional[List[Tuple[int, int]]]:
         goal_dists = dist_oracle.get_all_from(goal_v)
+        if goal_dists[start_v] > start_batt:
+            return None
         min_goal_t = max(min_goal_t, start_t + goal_dists[start_v])
         while (robot_id, goal_v, min_goal_t) in constraints:
             min_goal_t += 1

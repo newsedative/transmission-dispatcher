@@ -32,6 +32,22 @@ class TimedArrivalTests(unittest.TestCase):
         self.assertEqual(len(path), 5)
         self.assertEqual(path[-1], (2, 2))
 
+    def test_insufficient_energy_does_not_search_a_long_horizon(self):
+        solver = GraphHandoffCpSatSolver(4, [(0, 1), (1, 2), (2, 3)])
+        pop = test_run.heapq.heappop
+        count = 0
+
+        def limited_pop(queue):
+            nonlocal count
+            count += 1
+            self.assertLess(count, 32, "Waiting cannot replenish energy")
+            return pop(queue)
+
+        with patch.object(test_run.heapq, 'heappop', limited_pop):
+            path = SpaceTimeAStar.plan(0, 0, 0, 1, 3, 0, 100000,
+                                      solver.adj, solver.oracle, set(), 2, {})
+        self.assertIsNone(path)
+
 
 if __name__ == '__main__':
     unittest.main()
